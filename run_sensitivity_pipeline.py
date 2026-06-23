@@ -18,12 +18,9 @@ Simulink runs are done, run the same command again:
 
   python run_sensitivity_pipeline.py
 
-Manual commands are still available:
+If the automatic search cannot find the actual/reference 0-100 file, pass it explicitly:
 
-  python run_sensitivity_pipeline.py setup-venv
-  python run_sensitivity_pipeline.py pre-sim --powertrain both
-  python run_sensitivity_pipeline.py post-sim --powertrain both
-  python run_sensitivity_pipeline.py auto --powertrain both
+  python run_sensitivity_pipeline.py auto --actuals_file path\to\NewActual_Simulation_Comparison.xlsx
 """
 
 from __future__ import annotations
@@ -63,9 +60,7 @@ def is_windows() -> bool:
 
 
 def venv_python() -> Path:
-    if is_windows():
-        return VENV_DIR / "Scripts" / "python.exe"
-    return VENV_DIR / "bin" / "python"
+    return VENV_DIR / ("Scripts/python.exe" if is_windows() else "bin/python")
 
 
 def current_python() -> Path:
@@ -86,9 +81,7 @@ def run(cmd: list[str | os.PathLike[str]], *, cwd: Path = ROOT, check: bool = Tr
 
 
 def selected_powertrains(value: str) -> list[str]:
-    if value == "both":
-        return ["hybrid", "bev"]
-    return [value]
+    return ["hybrid", "bev"] if value == "both" else [value]
 
 
 def ensure_paths(powertrains: Iterable[str]) -> None:
@@ -139,6 +132,7 @@ def default_args() -> argparse.Namespace:
         tolerance=0.10,
         input_csv=None,
         results_file=None,
+        actuals_file=None,
         sweep_results_dir=None,
         output_dir=None,
         no_venv_check=True,
@@ -146,14 +140,12 @@ def default_args() -> argparse.Namespace:
 
 
 def run_default_no_args() -> None:
-    """Run the default one-command workflow."""
     if not in_expected_venv():
         setup_venv()
         py = venv_python()
         print("\nRe-launching pipeline with the repo .venv Python...")
         run([py, Path(__file__).resolve(), "auto", "--powertrain", "both", "--no-venv-check"])
         return
-
     cmd_auto(default_args())
 
 
@@ -174,12 +166,14 @@ def run_split(pt: str, args: argparse.Namespace) -> None:
         cmd += ["--input_csv", Path(args.input_csv)]
     if args.results_file:
         cmd += ["--results_file", Path(args.results_file)]
+    if args.actuals_file:
+        cmd += ["--actuals_file", Path(args.actuals_file)]
     run(cmd)
 
 
 def run_sweep(pt: str, args: argparse.Namespace) -> None:
     cfg = POWERTRAINS[pt]
-    cmd = [
+    run([
         sys.executable,
         cfg["script"],
         "sweep",
@@ -187,13 +181,12 @@ def run_sweep(pt: str, args: argparse.Namespace) -> None:
         cfg["work_dir"],
         "--out_dir",
         cfg["work_dir"],
-    ]
-    run(cmd)
+    ])
 
 
 def run_analyze(pt: str, args: argparse.Namespace) -> None:
     cfg = POWERTRAINS[pt]
-    cmd = [
+    run([
         sys.executable,
         cfg["script"],
         "analyze",
@@ -205,8 +198,7 @@ def run_analyze(pt: str, args: argparse.Namespace) -> None:
         args.output_dir or str(cfg["work_dir"] / cfg["output_dir"]),
         "--tolerance",
         str(args.tolerance),
-    ]
-    run(cmd)
+    ])
 
 
 def result_candidates(pt: str, sweep_results_dir: Path | None = None) -> list[Path]:
@@ -261,7 +253,7 @@ def cmd_post_sim(args: argparse.Namespace) -> None:
         if missing and not args.ignore_missing_results:
             print(f"\nCannot analyze {pt.upper()} yet. Missing result files:")
             for p in missing:
-                print(f"  {p}")
+                print(f"  {display_path(p)}")
             print("Use --ignore-missing-results only if your result files use alternative names supported by the analysis script.")
             continue
         print(f"\n=== {pt.upper()}: analyze ===")
@@ -309,7 +301,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--powertrain", choices=["hybrid", "bev", "both"], default="both")
         p.add_argument("--tolerance", type=float, default=0.10, help="Relative pass/fail tolerance; default 0.10 = +/-10%%.")
         p.add_argument("--input_csv", default=None, help="Optional explicit input CSV path for split.")
-        p.add_argument("--results_file", default=None, help="Optional explicit original results/comparison file for split.")
+        p.add_argument("--results_file", default=None, help="Optional explicit simulation result file for split.")
+        p.add_argument("--actuals_file", default=None, help="Optional file containing RUN_ID + Actual_0_to_100, or Actual_0_to_100 in matching row order.")
         p.add_argument("--sweep_results_dir", default=None, help="Directory containing sweep_results_*.xlsx/csv for analyze.")
         p.add_argument("--output_dir", default=None, help="Optional output dir for analyze. For both, prefer leaving this empty.")
         p.add_argument("--no-venv-check", action="store_true", help="Do not warn when current Python is not .venv Python.")
