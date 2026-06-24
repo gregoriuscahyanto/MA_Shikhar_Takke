@@ -3,3 +3,4 @@ Results*.mat
 **/slprj/
 *.slxc
 *.slx.autosave
+.venv/
