@@ -57,12 +57,18 @@ function T_out = DoE_main_sensitivity(csv_filename, output_filename, task_id, ch
     all_configs = loadConfig(csv_filename);
     total_configs = length(all_configs);
 
-    if nargin < 4 || isempty(chunk_size) || isinf(chunk_size)
+    task_id = normalizePositiveInteger(task_id, 1);
+
+    if nargin < 4 || isempty(chunk_size) || isinf(doubleOrNaN(chunk_size))
         chunk_size = total_configs;
     end
+    chunk_size = normalizePositiveInteger(chunk_size, total_configs);
 
     start_idx = (task_id - 1) * chunk_size + 1;
     end_idx = min(start_idx + chunk_size - 1, total_configs);
+
+    fprintf('Task ID    : %d\n', task_id);
+    fprintf('Chunk size : %d\n', chunk_size);
 
     if start_idx > total_configs
         fprintf('Start index %d > total configs %d. Returning empty table.\n', start_idx, total_configs);
@@ -78,25 +84,23 @@ function T_out = DoE_main_sensitivity(csv_filename, output_filename, task_id, ch
     done_run_ids = [];
 
     if isfile(output_filename)
-        try
-            existing_results = readtable(output_filename, 'VariableNamingRule', 'preserve');
-            existing_results.Properties.VariableNames = matlab.lang.makeValidName(existing_results.Properties.VariableNames);
+        [existing_results, read_ok] = readExistingResults(output_filename);
 
+        if read_ok && height(existing_results) > 0
             if ismember('SWEEP_RUN_ID', existing_results.Properties.VariableNames)
-                done_sweep_ids = existing_results.SWEEP_RUN_ID;
+                done_sweep_ids = numericColumn(existing_results.SWEEP_RUN_ID);
                 done_sweep_ids = done_sweep_ids(~isnan(done_sweep_ids));
                 fprintf('Resume mode: found %d existing SWEEP_RUN_IDs.\n', numel(done_sweep_ids));
             elseif ismember('RUN_ID', existing_results.Properties.VariableNames)
-                done_run_ids = existing_results.RUN_ID;
+                done_run_ids = numericColumn(existing_results.RUN_ID);
                 done_run_ids = done_run_ids(~isnan(done_run_ids));
                 fprintf('Resume mode: found %d existing RUN_IDs.\n', numel(done_run_ids));
+            else
+                fprintf('Resume mode: existing output has no SWEEP_RUN_ID/RUN_ID column. Continuing carefully.\n');
             end
-        catch ME
-            fprintf('Could not read existing output file for resume. Starting new output.\n');
-            fprintf('%s\n', ME.message);
+        elseif ~read_ok
+            fprintf('Existing output could not be read. It was renamed; starting a new checkpoint file.\n');
             existing_results = table();
-            done_sweep_ids = [];
-            done_run_ids = [];
         end
     end
 
@@ -217,8 +221,10 @@ function T_out = DoE_main_sensitivity(csv_filename, output_filename, task_id, ch
     end
 
     if isfile(output_filename)
-        T_out = readtable(output_filename, 'VariableNamingRule', 'preserve');
-        T_out.Properties.VariableNames = matlab.lang.makeValidName(T_out.Properties.VariableNames);
+        [T_out, read_ok] = readExistingResults(output_filename);
+        if ~read_ok
+            T_out = table();
+        end
     else
         T_out = table();
     end
@@ -301,12 +307,15 @@ function existing_results = writeCheckpoint(existing_results, results_struct, ou
     end
 
     if ismember('SWEEP_RUN_ID', combined_table.Properties.VariableNames)
-        combined_table = combined_table(~isnan(combined_table.SWEEP_RUN_ID), :);
-        [~, ia] = unique(combined_table.SWEEP_RUN_ID, 'stable');
+        sweep_ids = numericColumn(combined_table.SWEEP_RUN_ID);
+        combined_table = combined_table(~isnan(sweep_ids), :);
+        sweep_ids = sweep_ids(~isnan(sweep_ids));
+        [~, ia] = unique(sweep_ids, 'stable');
         combined_table = combined_table(ia, :);
         combined_table = sortrows(combined_table, 'SWEEP_RUN_ID');
     elseif ismember('RUN_ID', combined_table.Properties.VariableNames)
-        [~, ia] = unique(combined_table.RUN_ID, 'stable');
+        run_ids = numericColumn(combined_table.RUN_ID);
+        [~, ia] = unique(run_ids, 'stable');
         combined_table = combined_table(ia, :);
         combined_table = sortrows(combined_table, 'RUN_ID');
     end
@@ -316,12 +325,32 @@ function existing_results = writeCheckpoint(existing_results, results_struct, ou
         mkdir(out_dir);
     end
 
-    writetable(combined_table, output_filename);
+    % Safer checkpointing:
+    % First write a complete temporary XLSX, then replace the target file.
+    % If the job is killed during writetable(), the old output_filename remains intact.
+    if isempty(out_dir)
+        tmp_file = [tempname(pwd), '.xlsx'];
+    else
+        tmp_file = [tempname(out_dir), '.xlsx'];
+    end
+
+    try
+        writetable(combined_table, tmp_file);
+        movefile(tmp_file, output_filename, 'f');
+    catch ME
+        if isfile(tmp_file)
+            try
+                delete(tmp_file);
+            catch
+            end
+        end
+        rethrow(ME);
+    end
+
     fprintf('Checkpoint saved: %s | rows: %d\n', output_filename, height(combined_table));
 
     existing_results = combined_table;
 end
-
 
 function T = appendTablesByName(T1, T2)
     names1 = T1.Properties.VariableNames;
@@ -593,6 +622,94 @@ function mainStruct = appendStruct(mainStruct, newStruct)
     end
 
     mainStruct = [mainStruct; newStruct];
+end
+
+
+function [T, ok] = readExistingResults(filename)
+    ok = false;
+    T = table();
+
+    try
+        T = readtable(filename, 'VariableNamingRule', 'preserve');
+        T.Properties.VariableNames = matlab.lang.makeValidName(T.Properties.VariableNames);
+        ok = true;
+    catch ME
+        fprintf('Could not read existing output file for resume: %s\n', filename);
+        fprintf('%s\n', ME.message);
+
+        try
+            [p, n, e] = fileparts(filename);
+            stamp = char(datetime('now', 'Format', 'yyyyMMdd_HHmmss'));
+            corrupt_name = fullfile(p, [n, '.corrupt_', stamp, e]);
+            movefile(filename, corrupt_name, 'f');
+            fprintf('Unreadable output file renamed to: %s\n', corrupt_name);
+        catch ME2
+            fprintf('Could not rename unreadable output file. Leaving it untouched.\n');
+            fprintf('%s\n', ME2.message);
+        end
+    end
+end
+
+
+function val = normalizePositiveInteger(raw, defaultVal)
+    val = doubleOrNaN(raw);
+
+    if isnan(val) || isinf(val) || val < 1
+        val = defaultVal;
+    end
+
+    val = max(1, floor(val));
+end
+
+
+function val = doubleOrNaN(raw)
+    try
+        if isnumeric(raw)
+            if isempty(raw)
+                val = NaN;
+            else
+                val = double(raw(1));
+            end
+            return;
+        end
+
+        if isstring(raw) || ischar(raw)
+            val = str2double(string(raw));
+            return;
+        end
+    catch
+    end
+
+    val = NaN;
+end
+
+
+function col = numericColumn(colIn)
+    if isnumeric(colIn)
+        col = double(colIn);
+        return;
+    end
+
+    if iscell(colIn)
+        col = NaN(numel(colIn), 1);
+        for k = 1:numel(colIn)
+            col(k) = doubleOrNaN(colIn{k});
+        end
+        return;
+    end
+
+    if isstring(colIn) || ischar(colIn)
+        col = str2double(string(colIn));
+        col = col(:);
+        return;
+    end
+
+    try
+        col = double(colIn);
+        col = col(:);
+    catch
+        col = NaN(numel(colIn), 1);
+    end
 end
 
 
