@@ -44,7 +44,18 @@ DEFAULT_MATLAB_EXE = "matlab"
 GROUP_SHORT = ["G1", "G2", "G3", "G4", "G5"]
 GROUP_LABELS = ["G1_lt5s", "G2_5to7s", "G3_7to10s", "G4_10to13s", "G5_gt13s"]
 
+POWERTRAIN_ORDER = ["ice", "hybrid", "bev"]
+
 POWERTRAINS = {
+    "ice": {
+        "script": ROOT / "Data_Analysis" / "Sensitivity analysis" / "ICE" / "Sensitivity_Analysis_ICE.py",
+        "work_dir": ROOT / "Data_Analysis" / "Sensitivity analysis" / "ICE",
+        "sensitivity_prefix": "sensitivity_ice",
+        "sweep_prefix": "sweep_ice",
+        "sweep_pattern": "sweep_ice_G*.csv",
+        "result_prefix": "sweep_results_ice",
+        "output_dir": "ice_sensitivity_results",
+    },
     "hybrid": {
         "script": ROOT / "Data_Analysis" / "Sensitivity analysis" / "Hybrid" / "Sensitivity_Analysis_Hybrid.py",
         "work_dir": ROOT / "Data_Analysis" / "Sensitivity analysis" / "Hybrid",
@@ -94,7 +105,12 @@ def run(cmd: list[str | os.PathLike[str]], *, cwd: Path = ROOT, check: bool = Tr
 
 
 def selected_powertrains(value: str) -> list[str]:
-    return ["hybrid", "bev"] if value == "both" else [value]
+    if value == "all":
+        return POWERTRAIN_ORDER
+    if value == "both":
+        # Backward-compatible old meaning: Hybrid + BEV.
+        return ["hybrid", "bev"]
+    return [value]
 
 
 def display_path(path: Path) -> str:
@@ -149,7 +165,7 @@ def warn_if_not_venv(args: argparse.Namespace) -> None:
 
 def default_args() -> argparse.Namespace:
     return argparse.Namespace(
-        powertrain="both",
+        powertrain="all",
         tolerance=0.10,
         input_csv=None,
         results_file=None,
@@ -175,7 +191,7 @@ def run_default_no_args() -> None:
             Path(__file__).resolve(),
             "auto",
             "--powertrain",
-            "both",
+            "all",
             "--run-matlab",
             "--no-venv-check",
         ])
@@ -654,7 +670,7 @@ def cmd_auto(args: argparse.Namespace) -> None:
 
 
 def add_common_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--powertrain", choices=["hybrid", "bev", "both"], default="both")
+    p.add_argument("--powertrain", choices=["ice", "hybrid", "bev", "both", "all"], default="all")
     p.add_argument("--tolerance", type=float, default=0.10)
     p.add_argument("--input_csv", default=None)
     p.add_argument("--results_file", default=None)
@@ -675,7 +691,7 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Automate Hybrid/BEV sensitivity-analysis workflow.")
+    parser = argparse.ArgumentParser(description="Automate ICE/Hybrid/BEV sensitivity-analysis workflow.")
     sub = parser.add_subparsers(dest="cmd", required=False)
 
     p_setup = sub.add_parser("setup-venv")

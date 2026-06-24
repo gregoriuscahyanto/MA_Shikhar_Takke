@@ -1,7 +1,7 @@
 function T_out = DoE_main_sensitivity(csv_filename, output_filename, task_id, chunk_size)
 % DoE_main_sensitivity.m
 % Generic DoE runner for sensitivity sweeps.
-% Compatible with Hybrid and BEV CSV inputs.
+% Compatible with ICE, Hybrid and BEV CSV inputs.
 %
 % Features:
 %   - Resume support: existing SWEEP_RUN_IDs in output_filename are skipped.
@@ -9,6 +9,7 @@ function T_out = DoE_main_sensitivity(csv_filename, output_filename, task_id, ch
 %   - Suppresses noisy Simulink warnings/diagnostics during batch runs.
 %
 % Usage:
+%   DoE_main_sensitivity('C:/.../sweep_ice_G1_lt5s.csv', 'C:/.../sweep_results_ice_G1.xlsx')
 %   DoE_main_sensitivity('C:/.../sweep_hybrid_G1_lt5s.csv', 'C:/.../sweep_results_hybrid_G1.xlsx')
 %   DoE_main_sensitivity('C:/.../sweep_bev_G1_lt5s.csv', 'C:/.../sweep_results_bev_G1.xlsx')
 
