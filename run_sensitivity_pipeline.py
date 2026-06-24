@@ -463,7 +463,7 @@ def run_one_matlab_job(
 
 
 def result_files_for_sweep(pt: str, sweep_file: Path) -> list[Path]:
-    """Return all XLSX result fragments for one powertrain/group.
+    """Return all XLSX result files/fragments for one powertrain/group.
 
     This is intentionally broad for backward compatibility. It includes:
       - final files:        sweep_results_hybrid_G1.xlsx
@@ -485,6 +485,44 @@ def result_files_for_sweep(pt: str, sweep_file: Path) -> list[Path]:
             seen.add(p)
 
     return files
+
+
+def is_cleanup_fragment_result_file(pt: str, sweep_file: Path, result_file: Path) -> bool:
+    """Return True for old per-task/per-resume XLSX fragments safe to delete after merge."""
+    final_file = output_path_for_sweep(pt, sweep_file)
+    if result_file.resolve() == final_file.resolve():
+        return False
+
+    cfg = POWERTRAINS[pt]
+    group_short = group_short_from_filename(sweep_file)
+    prefix = f"{cfg['result_prefix']}_{group_short}"
+    name = result_file.name
+
+    return (
+        name.startswith(prefix + "_task")
+        or name.startswith(prefix + "_resume_")
+    ) and name.endswith(".xlsx")
+
+
+def cleanup_merged_result_fragments(pt: str, sweep_file: Path, merged_files: Iterable[Path]) -> int:
+    """Delete old task/resume fragments after their rows were merged into the final XLSX.
+
+    Only files that were read successfully and match the known fragment naming
+    schemes are removed. The final result XLSX is never deleted.
+    """
+    deleted = 0
+    for result_file in merged_files:
+        if not is_cleanup_fragment_result_file(pt, sweep_file, result_file):
+            continue
+        try:
+            result_file.unlink()
+            deleted += 1
+            print(f"Deleted merged fragment: {display_path(result_file)}")
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            print(f"WARNING: Could not delete merged fragment {display_path(result_file)}: {exc}")
+    return deleted
 
 
 def normalize_id_value(value):
@@ -542,12 +580,14 @@ def merge_existing_results_for_sweep(pt: str, sweep_file: Path) -> tuple[Path, s
     result_files = result_files_for_sweep(pt, sweep_file)
 
     frames = []
+    merged_files = []
     for result_file in result_files:
         try:
             df = pd.read_excel(result_file)
         except Exception as exc:
             print(f"WARNING: Could not read {display_path(result_file)}: {exc}")
             continue
+        merged_files.append(result_file)
         if len(df) > 0:
             frames.append(df)
 
@@ -572,10 +612,13 @@ def merge_existing_results_for_sweep(pt: str, sweep_file: Path) -> tuple[Path, s
     combined.to_excel(tmp_file, index=False)
     tmp_file.replace(final_file)
 
+    deleted_fragments = cleanup_merged_result_fragments(pt, sweep_file, merged_files)
+
     done_ids = ids_from_dataframe(combined, "SWEEP_RUN_ID")
     print(
         f"Merged progress for {display_path(sweep_file)} -> {display_path(final_file)} | "
-        f"files: {len(result_files)} | rows: {len(combined)} | done ids: {len(done_ids)}"
+        f"files: {len(result_files)} | rows: {len(combined)} | "
+        f"done ids: {len(done_ids)} | deleted fragments: {deleted_fragments}"
     )
     return final_file, done_ids
 
@@ -814,10 +857,26 @@ def run_resume_manifest_worker(args: argparse.Namespace) -> None:
         if not pending_csv.exists():
             raise FileNotFoundError(f"Pending CSV not found: {pending_csv}")
 
+        # Copy the small pending chunk to node-local TMPDIR when available.
+        # This protects MATLAB from a plan-directory race on shared storage and
+        # also reduces repeated metadata reads from the workspace filesystem.
+        matlab_input_csv = pending_csv
+        tmp_root_raw = os.environ.get("TMPDIR", "")
+        if tmp_root_raw:
+            try:
+                tmp_input_dir = Path(tmp_root_raw) / "sensitivity_resume_inputs"
+                tmp_input_dir.mkdir(parents=True, exist_ok=True)
+                matlab_input_csv = tmp_input_dir / pending_csv.name
+                shutil.copy2(pending_csv, matlab_input_csv)
+                print(f"Copied input CSV to node-local file: {matlab_input_csv}")
+            except Exception as exc:
+                matlab_input_csv = pending_csv
+                print(f"WARNING: Could not copy pending CSV to TMPDIR. Using original file. Reason: {exc}")
+
         # The pending CSV already contains only missing rows, so process the whole file.
         # Existing output_xlsx is still resume-safe because DoE_main_sensitivity skips
         # SWEEP_RUN_IDs already present inside that file.
-        run_one_matlab_job(args.matlab_exe, pending_csv, output_xlsx, args.dry_run)
+        run_one_matlab_job(args.matlab_exe, matlab_input_csv, output_xlsx, args.dry_run)
 
 def run_matlab_sweeps(powertrains: Iterable[str], args: argparse.Namespace) -> None:
     doe_file = SIM_DIR / "DoE_main_sensitivity.m"
