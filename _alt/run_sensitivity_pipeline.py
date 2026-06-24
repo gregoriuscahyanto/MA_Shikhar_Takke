@@ -328,104 +328,33 @@ def find_sweep_files(pt: str) -> list[Path]:
     return expected if expected else files
 
 
-def output_path_for_sweep(pt: str, sweep_file: Path, task_id: int | None = None) -> Path:
+def output_path_for_sweep(pt: str, sweep_file: Path) -> Path:
     cfg = POWERTRAINS[pt]
     group_short = group_short_from_filename(sweep_file)
-    base = cfg["work_dir"] / f"{cfg['result_prefix']}_{group_short}"
-
-    # Non-array run: one complete result file per group.
-    if task_id is None:
-        return base.with_suffix(".xlsx")
-
-    # SLURM-array run: one independent result file per task.
-    # This is critical: never let parallel tasks write into the same XLSX.
-    return cfg["work_dir"] / f"{cfg['result_prefix']}_{group_short}_task{task_id:03d}.xlsx"
+    return cfg["work_dir"] / f"{cfg['result_prefix']}_{group_short}.xlsx"
 
 
-def chunk_output_pattern_for_sweep(pt: str, sweep_file: Path) -> str:
-    cfg = POWERTRAINS[pt]
-    group_short = group_short_from_filename(sweep_file)
-    return f"{cfg['result_prefix']}_{group_short}_task*.xlsx"
-
-
-def count_csv_data_rows(csv_file: Path) -> int:
-    # Fast enough for sweep CSVs and avoids importing pandas in the MATLAB phase.
-    with csv_file.open("r", encoding="utf-8", errors="ignore") as f:
-        line_count = sum(1 for _ in f)
-    return max(0, line_count - 1)
-
-
-def slurm_array_context() -> tuple[int, int, int] | None:
-    raw_task_id = os.environ.get("SLURM_ARRAY_TASK_ID")
-    if not raw_task_id:
-        return None
-
-    task_id = int(raw_task_id)
-    task_min = int(os.environ.get("SLURM_ARRAY_TASK_MIN", "1"))
-
-    if os.environ.get("SLURM_ARRAY_TASK_COUNT"):
-        task_count = int(os.environ["SLURM_ARRAY_TASK_COUNT"])
-    elif os.environ.get("SLURM_ARRAY_TASK_MAX"):
-        task_max = int(os.environ["SLURM_ARRAY_TASK_MAX"])
-        task_count = task_max - task_min + 1
-    else:
-        task_count = 1
-
-    # MATLAB chunk indexing should always be 1..task_count even if the SLURM
-    # array uses a different minimum index. With --array=1-75 this equals task_id.
-    local_task_index = task_id - task_min + 1
-
-    if local_task_index < 1 or local_task_index > task_count:
-        raise RuntimeError(
-            f"Invalid SLURM array context: task_id={task_id}, "
-            f"task_min={task_min}, task_count={task_count}"
-        )
-
-    return task_id, local_task_index, task_count
-
-
-def build_matlab_batch_command(
-    sweep_file: Path,
-    output_file: Path,
-    task_index: int | None = None,
-    chunk_size: int | None = None,
-) -> str:
+def build_matlab_batch_command(sweep_file: Path, output_file: Path) -> str:
     sim_dir = matlab_quote(SIM_DIR)
     sweep = matlab_quote(sweep_file)
     out = matlab_quote(output_file)
 
-    if task_index is None or chunk_size is None:
-        doe_call = f"DoE_main_sensitivity({sweep}, {out});"
-    else:
-        doe_call = f"DoE_main_sensitivity({sweep}, {out}, {task_index}, {chunk_size});"
-
     return (
         f"cd({sim_dir}); "
         f"addpath({sim_dir}); "
-        f"try; {doe_call} "
-        f"catch ME; disp(getReport(ME, 'extended', 'hyperlinks', 'off')); exit(1); end;"
+        f"DoE_main_sensitivity({sweep}, {out});"
     )
 
 
-def run_one_matlab_job(
-    matlab_exe: str,
-    sweep_file: Path,
-    output_file: Path,
-    dry_run: bool,
-    task_index: int | None = None,
-    chunk_size: int | None = None,
-) -> None:
-    batch_command = build_matlab_batch_command(sweep_file, output_file, task_index, chunk_size)
+def run_one_matlab_job(matlab_exe: str, sweep_file: Path, output_file: Path, dry_run: bool) -> None:
+    batch_command = build_matlab_batch_command(sweep_file, output_file)
 
     cmd = [matlab_exe, "-batch", batch_command]
 
     print("\n============================================================")
     print("MATLAB simulation")
-    print(f"Input     : {display_path(sweep_file)}")
-    print(f"Output    : {display_path(output_file)}")
-    if task_index is not None and chunk_size is not None:
-        print(f"Task index: {task_index}")
-        print(f"Chunk size: {chunk_size}")
+    print(f"Input : {display_path(sweep_file)}")
+    print(f"Output: {display_path(output_file)}")
     print("Command:")
     print(" ".join(f'"{c}"' if " " in c else c for c in cmd))
 
@@ -433,54 +362,6 @@ def run_one_matlab_job(
         return
 
     subprocess.run(cmd, cwd=str(ROOT), check=True)
-
-
-def merge_chunk_outputs_for_powertrain(pt: str) -> None:
-    # Merge files like sweep_results_hybrid_G1_task001.xlsx into
-    # sweep_results_hybrid_G1.xlsx before analysis.
-    try:
-        import pandas as pd
-    except ImportError as exc:
-        raise RuntimeError("pandas is required for merging chunked MATLAB outputs") from exc
-
-    for sweep_file in find_sweep_files(pt):
-        final_file = output_path_for_sweep(pt, sweep_file)
-        pattern = chunk_output_pattern_for_sweep(pt, sweep_file)
-        chunk_files = sorted(final_file.parent.glob(pattern))
-
-        if not chunk_files:
-            continue
-
-        print(f"\nMerging {len(chunk_files)} chunk file(s) -> {display_path(final_file)}")
-
-        frames = []
-        for chunk_file in chunk_files:
-            try:
-                df = pd.read_excel(chunk_file)
-            except Exception as exc:
-                print(f"WARNING: Could not read {display_path(chunk_file)}: {exc}")
-                continue
-
-            if len(df) > 0:
-                frames.append(df)
-
-        if not frames:
-            print(f"WARNING: No rows found for {display_path(final_file)}")
-            continue
-
-        combined = pd.concat(frames, ignore_index=True, sort=False)
-
-        if "SWEEP_RUN_ID" in combined.columns:
-            combined = combined[combined["SWEEP_RUN_ID"].notna()]
-            combined = combined.drop_duplicates(subset=["SWEEP_RUN_ID"], keep="first")
-            combined = combined.sort_values("SWEEP_RUN_ID")
-        elif "RUN_ID" in combined.columns:
-            combined = combined.drop_duplicates(subset=["RUN_ID"], keep="first")
-            combined = combined.sort_values("RUN_ID")
-
-        final_file.parent.mkdir(parents=True, exist_ok=True)
-        combined.to_excel(final_file, index=False)
-        print(f"Merged rows: {len(combined)}")
 
 
 def run_matlab_sweeps(powertrains: Iterable[str], args: argparse.Namespace) -> None:
@@ -495,20 +376,6 @@ def run_matlab_sweeps(powertrains: Iterable[str], args: argparse.Namespace) -> N
             "Create Simulation_Model/DoE_main_sensitivity.m first."
         )
 
-    array_ctx = slurm_array_context()
-
-    if array_ctx is None:
-        print("\nNo SLURM array detected: each sweep CSV is processed completely.")
-        actual_task_id = None
-        task_index = None
-        task_count = None
-    else:
-        actual_task_id, task_index, task_count = array_ctx
-        print("\nSLURM array detected.")
-        print(f"SLURM_ARRAY_TASK_ID : {actual_task_id}")
-        print(f"Local task index    : {task_index}")
-        print(f"Array task count    : {task_count}")
-
     any_file = False
 
     for pt in powertrains:
@@ -522,42 +389,15 @@ def run_matlab_sweeps(powertrains: Iterable[str], args: argparse.Namespace) -> N
 
         for sweep_file in sweep_files:
             any_file = True
-
-            if array_ctx is None:
-                output_file = output_path_for_sweep(pt, sweep_file)
-                if output_file.exists():
-                    print(f"Existing result file found. MATLAB will resume inside it: {display_path(output_file)}")
-                run_one_matlab_job(args.matlab_exe, sweep_file, output_file, args.dry_run)
-                continue
-
-            total_rows = count_csv_data_rows(sweep_file)
-            chunk_size = max(1, (total_rows + task_count - 1) // task_count)
-            output_file = output_path_for_sweep(pt, sweep_file, actual_task_id)
-
-            start_idx = (task_index - 1) * chunk_size + 1
-            end_idx = min(start_idx + chunk_size - 1, total_rows)
-
-            print("\nChunk assignment")
-            print(f"Sweep file : {display_path(sweep_file)}")
-            print(f"Rows total : {total_rows}")
-            print(f"Rows task  : {start_idx}..{end_idx}")
-            print(f"Output     : {display_path(output_file)}")
-
-            if start_idx > total_rows:
-                print("No rows assigned to this task for this sweep file. Skipping MATLAB call.")
-                continue
+            output_file = output_path_for_sweep(pt, sweep_file)
 
             if output_file.exists():
-                print(f"Existing task result found. MATLAB will resume inside it: {display_path(output_file)}")
+                print(f"Existing result file found. MATLAB will resume inside it: {display_path(output_file)}")
 
-            run_one_matlab_job(
-                args.matlab_exe,
-                sweep_file,
-                output_file,
-                args.dry_run,
-                task_index,
-                chunk_size,
-            )
+            # Important:
+            # Do NOT skip when output_file exists.
+            # DoE_main_sensitivity.m handles resume internally by checking SWEEP_RUN_ID.
+            run_one_matlab_job(args.matlab_exe, sweep_file, output_file, args.dry_run)
 
     if not any_file:
         raise RuntimeError(
@@ -607,7 +447,6 @@ def cmd_post_sim(args: argparse.Namespace) -> None:
     ensure_paths(pts)
 
     for pt in pts:
-        merge_chunk_outputs_for_powertrain(pt)
         missing = missing_result_files(pt, args)
 
         if missing and not args.ignore_missing_results:
@@ -635,7 +474,6 @@ def cmd_auto(args: argparse.Namespace) -> None:
     any_missing = False
 
     for pt in pts:
-        merge_chunk_outputs_for_powertrain(pt)
         missing = missing_result_files(pt, args)
 
         if missing:
