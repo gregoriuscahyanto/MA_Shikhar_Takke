@@ -11,6 +11,8 @@ Behavior:
   - Reuses existing sweep CSV files by default.
   - Calls MATLAB even when result XLSX exists, so MATLAB can resume internally.
   - MATLAB DoE_main_sensitivity.m skips existing SWEEP_RUN_IDs inside the XLSX.
+  - HPC resume mode can merge all existing *_taskXXX.xlsx files, detect missing SWEEP_RUN_IDs,
+    split only the missing rows into fixed-size chunks, and distribute those chunks over workers.
   - Use --force-regenerate-csv to recreate split/sweep CSV files.
 
 If MATLAB is not in PATH, edit DEFAULT_MATLAB_EXE below or run:
@@ -21,6 +23,9 @@ If MATLAB is not in PATH, edit DEFAULT_MATLAB_EXE below or run:
 from __future__ import annotations
 
 import argparse
+import csv
+import math
+import shutil
 import os
 import platform
 import re
@@ -44,18 +49,7 @@ DEFAULT_MATLAB_EXE = "matlab"
 GROUP_SHORT = ["G1", "G2", "G3", "G4", "G5"]
 GROUP_LABELS = ["G1_lt5s", "G2_5to7s", "G3_7to10s", "G4_10to13s", "G5_gt13s"]
 
-POWERTRAIN_ORDER = ["ice", "hybrid", "bev"]
-
 POWERTRAINS = {
-    "ice": {
-        "script": ROOT / "Data_Analysis" / "Sensitivity analysis" / "ICE" / "Sensitivity_Analysis_ICE.py",
-        "work_dir": ROOT / "Data_Analysis" / "Sensitivity analysis" / "ICE",
-        "sensitivity_prefix": "sensitivity_ice",
-        "sweep_prefix": "sweep_ice",
-        "sweep_pattern": "sweep_ice_G*.csv",
-        "result_prefix": "sweep_results_ice",
-        "output_dir": "ice_sensitivity_results",
-    },
     "hybrid": {
         "script": ROOT / "Data_Analysis" / "Sensitivity analysis" / "Hybrid" / "Sensitivity_Analysis_Hybrid.py",
         "work_dir": ROOT / "Data_Analysis" / "Sensitivity analysis" / "Hybrid",
@@ -105,12 +99,7 @@ def run(cmd: list[str | os.PathLike[str]], *, cwd: Path = ROOT, check: bool = Tr
 
 
 def selected_powertrains(value: str) -> list[str]:
-    if value == "all":
-        return POWERTRAIN_ORDER
-    if value == "both":
-        # Backward-compatible old meaning: Hybrid + BEV.
-        return ["hybrid", "bev"]
-    return [value]
+    return ["hybrid", "bev"] if value == "both" else [value]
 
 
 def display_path(path: Path) -> str:
@@ -165,7 +154,7 @@ def warn_if_not_venv(args: argparse.Namespace) -> None:
 
 def default_args() -> argparse.Namespace:
     return argparse.Namespace(
-        powertrain="all",
+        powertrain="both",
         tolerance=0.10,
         input_csv=None,
         results_file=None,
@@ -191,7 +180,7 @@ def run_default_no_args() -> None:
             Path(__file__).resolve(),
             "auto",
             "--powertrain",
-            "all",
+            "both",
             "--run-matlab",
             "--no-venv-check",
         ])
@@ -319,8 +308,29 @@ def result_candidates(pt: str, sweep_results_dir: Path | None = None) -> list[Pa
 
 
 def missing_result_files(pt: str, args: argparse.Namespace) -> list[Path]:
+    # Only require final result files for sweep CSVs that actually contain rows.
+    # Empty groups may legitimately have no result file and are skipped by the analyzer.
     result_dir = Path(args.sweep_results_dir) if args.sweep_results_dir else None
-    return [p for p in result_candidates(pt, result_dir) if not p.exists()]
+    if result_dir is not None:
+        cfg = POWERTRAINS[pt]
+        files = []
+        for sweep_file in find_sweep_files(pt):
+            if count_csv_data_rows(sweep_file) <= 0:
+                continue
+            group_short = group_short_from_filename(sweep_file)
+            candidate = result_dir / f"{cfg['result_prefix']}_{group_short}.xlsx"
+            if not candidate.exists():
+                files.append(candidate)
+        return files
+
+    files = []
+    for sweep_file in find_sweep_files(pt):
+        if count_csv_data_rows(sweep_file) <= 0:
+            continue
+        candidate = output_path_for_sweep(pt, sweep_file)
+        if not candidate.exists():
+            files.append(candidate)
+    return files
 
 
 def matlab_quote(path_or_text: str | Path) -> str:
@@ -451,53 +461,363 @@ def run_one_matlab_job(
     subprocess.run(cmd, cwd=str(ROOT), check=True)
 
 
-def merge_chunk_outputs_for_powertrain(pt: str) -> None:
-    # Merge files like sweep_results_hybrid_G1_task001.xlsx into
-    # sweep_results_hybrid_G1.xlsx before analysis.
+
+def result_files_for_sweep(pt: str, sweep_file: Path) -> list[Path]:
+    """Return all XLSX result fragments for one powertrain/group.
+
+    This is intentionally broad for backward compatibility. It includes:
+      - final files:        sweep_results_hybrid_G1.xlsx
+      - old static chunks:  sweep_results_hybrid_G1_task001.xlsx
+      - new gap chunks:    sweep_results_hybrid_G1_resume_000001.xlsx
+    """
+    cfg = POWERTRAINS[pt]
+    group_short = group_short_from_filename(sweep_file)
+    prefix = f"{cfg['result_prefix']}_{group_short}"
+    files = []
+    seen = set()
+
+    for p in sorted(cfg["work_dir"].glob(f"{prefix}*.xlsx")):
+        name = p.name
+        if name.startswith("~$") or name.endswith(".tmp.xlsx") or name.endswith(".part.xlsx"):
+            continue
+        if p not in seen:
+            files.append(p)
+            seen.add(p)
+
+    return files
+
+
+def normalize_id_value(value):
+    try:
+        x = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(x):
+        return None
+    rounded = round(x)
+    if abs(x - rounded) < 1e-9:
+        return int(rounded)
+    return x
+
+
+def ids_from_dataframe(df, preferred_col: str = "SWEEP_RUN_ID") -> set:
+    if preferred_col in df.columns:
+        col = preferred_col
+    elif "RUN_ID" in df.columns:
+        col = "RUN_ID"
+    else:
+        return set()
+
+    ids = set()
+    for value in df[col].tolist():
+        norm = normalize_id_value(value)
+        if norm is not None:
+            ids.add(norm)
+    return ids
+
+
+def ids_from_excel_file(path: Path, preferred_col: str = "SWEEP_RUN_ID") -> set:
+    try:
+        import pandas as pd
+        df = pd.read_excel(path)
+    except Exception as exc:
+        print(f"WARNING: Could not read result file for ID scan {display_path(path)}: {exc}")
+        return set()
+    return ids_from_dataframe(df, preferred_col)
+
+
+def merge_existing_results_for_sweep(pt: str, sweep_file: Path) -> tuple[Path, set]:
+    """Merge all existing fragments for one sweep into the final result file.
+
+    Returns the final file path and the set of completed SWEEP_RUN_IDs.
+    Corrupt or half-written XLSX files are ignored, so a timeout during an XLSX write
+    does not destroy the rest of the resume plan.
+    """
     try:
         import pandas as pd
     except ImportError as exc:
-        raise RuntimeError("pandas is required for merging chunked MATLAB outputs") from exc
+        raise RuntimeError("pandas is required for merging result fragments") from exc
+
+    final_file = output_path_for_sweep(pt, sweep_file)
+    result_files = result_files_for_sweep(pt, sweep_file)
+
+    frames = []
+    for result_file in result_files:
+        try:
+            df = pd.read_excel(result_file)
+        except Exception as exc:
+            print(f"WARNING: Could not read {display_path(result_file)}: {exc}")
+            continue
+        if len(df) > 0:
+            frames.append(df)
+
+    if not frames:
+        print(f"No existing result fragments found for {display_path(sweep_file)}")
+        return final_file, set()
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+
+    if "SWEEP_RUN_ID" in combined.columns:
+        combined = combined[combined["SWEEP_RUN_ID"].notna()].copy()
+        combined["SWEEP_RUN_ID"] = pd.to_numeric(combined["SWEEP_RUN_ID"], errors="coerce")
+        combined = combined[combined["SWEEP_RUN_ID"].notna()].copy()
+        combined = combined.drop_duplicates(subset=["SWEEP_RUN_ID"], keep="first")
+        combined = combined.sort_values("SWEEP_RUN_ID")
+    elif "RUN_ID" in combined.columns:
+        combined = combined.drop_duplicates(subset=["RUN_ID"], keep="first")
+        combined = combined.sort_values("RUN_ID")
+
+    final_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = final_file.with_name(final_file.stem + ".tmp.xlsx")
+    combined.to_excel(tmp_file, index=False)
+    tmp_file.replace(final_file)
+
+    done_ids = ids_from_dataframe(combined, "SWEEP_RUN_ID")
+    print(
+        f"Merged progress for {display_path(sweep_file)} -> {display_path(final_file)} | "
+        f"files: {len(result_files)} | rows: {len(combined)} | done ids: {len(done_ids)}"
+    )
+    return final_file, done_ids
+
+
+def merge_chunk_outputs_for_powertrain(pt: str) -> None:
+    # Backward-compatible merge. Includes old *_taskXXX.xlsx files and new
+    # *_resume_XXXXXX.xlsx gap chunk files.
+    for sweep_file in find_sweep_files(pt):
+        merge_existing_results_for_sweep(pt, sweep_file)
+
+
+def validate_final_results_for_powertrain(pt: str) -> None:
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise RuntimeError("pandas is required for validating merged MATLAB outputs") from exc
 
     for sweep_file in find_sweep_files(pt):
         final_file = output_path_for_sweep(pt, sweep_file)
-        pattern = chunk_output_pattern_for_sweep(pt, sweep_file)
-        chunk_files = sorted(final_file.parent.glob(pattern))
+        sweep_df = pd.read_csv(sweep_file)
 
-        if not chunk_files:
+        if len(sweep_df) == 0:
+            print(f"Validation skipped for empty sweep file: {display_path(sweep_file)}")
             continue
 
-        print(f"\nMerging {len(chunk_files)} chunk file(s) -> {display_path(final_file)}")
+        if not final_file.exists():
+            raise FileNotFoundError(f"Missing final result file: {display_path(final_file)}")
 
-        frames = []
-        for chunk_file in chunk_files:
-            try:
-                df = pd.read_excel(chunk_file)
-            except Exception as exc:
-                print(f"WARNING: Could not read {display_path(chunk_file)}: {exc}")
+        result_df = pd.read_excel(final_file)
+
+        if "SWEEP_RUN_ID" in sweep_df.columns and "SWEEP_RUN_ID" in result_df.columns:
+            expected_ids = ids_from_dataframe(sweep_df, "SWEEP_RUN_ID")
+            result_ids = ids_from_dataframe(result_df, "SWEEP_RUN_ID")
+            missing_ids = sorted(expected_ids - result_ids)
+
+            if missing_ids:
+                preview = ", ".join(str(x) for x in missing_ids[:20])
+                more = "" if len(missing_ids) <= 20 else f" ... (+{len(missing_ids) - 20} more)"
+                raise RuntimeError(
+                    f"Incomplete result file {display_path(final_file)}. "
+                    f"Missing {len(missing_ids)} SWEEP_RUN_ID(s): {preview}{more}"
+                )
+
+            print(f"Validated {display_path(final_file)}: {len(result_ids)}/{len(expected_ids)} SWEEP_RUN_IDs present")
+            continue
+
+        expected_rows = len(sweep_df)
+        result_rows = len(result_df)
+        if result_rows < expected_rows:
+            raise RuntimeError(
+                f"Incomplete result file {display_path(final_file)}. "
+                f"Rows present: {result_rows}, expected at least: {expected_rows}"
+            )
+
+        print(f"Validated {display_path(final_file)}: {result_rows}/{expected_rows} rows present")
+
+
+def plan_resume_chunks(powertrains: Iterable[str], args: argparse.Namespace) -> None:
+    """Create a gap-based resume plan from all existing result files.
+
+    The planner first merges all existing fragments, then compares the merged
+    SWEEP_RUN_IDs against every sweep CSV. Only missing rows are written into
+    fixed-size pending chunk CSVs. Worker tasks later consume the manifest.
+    """
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise RuntimeError("pandas is required for planning resume chunks") from exc
+
+    plan_dir = Path(args.plan_dir).resolve()
+    pending_dir = plan_dir / "pending"
+    worker_marker_dir = plan_dir / "worker_markers"
+    manifest_file = plan_dir / "manifest.csv"
+    summary_file = plan_dir / "summary.txt"
+
+    chunk_size = int(args.resume_chunk_size)
+    if chunk_size < 1:
+        raise ValueError("--resume-chunk-size must be >= 1")
+
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(pending_dir, ignore_errors=True)
+    shutil.rmtree(worker_marker_dir, ignore_errors=True)
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    worker_marker_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    summary_lines = []
+    global_chunk_id = 1
+
+    for pt in powertrains:
+        sweep_files = find_sweep_files(pt)
+        if not sweep_files:
+            print(f"No sweep files found for {pt.upper()}. Expected in {POWERTRAINS[pt]['work_dir']}")
+            continue
+
+        for sweep_file in sweep_files:
+            group_short = group_short_from_filename(sweep_file)
+            final_file, done_ids = merge_existing_results_for_sweep(pt, sweep_file)
+
+            sweep_df = pd.read_csv(sweep_file)
+            if len(sweep_df) == 0:
+                line = f"{pt.upper()} {group_short}: sweep file is empty; no chunks planned."
+                print(line)
+                summary_lines.append(line)
                 continue
 
-            if len(df) > 0:
-                frames.append(df)
+            if "SWEEP_RUN_ID" not in sweep_df.columns:
+                print(f"WARNING: {display_path(sweep_file)} has no SWEEP_RUN_ID. Creating row-order SWEEP_RUN_ID for planning.")
+                sweep_df = sweep_df.copy()
+                sweep_df.insert(0, "SWEEP_RUN_ID", range(1, len(sweep_df) + 1))
 
-        if not frames:
-            print(f"WARNING: No rows found for {display_path(final_file)}")
-            continue
+            sweep_df["SWEEP_RUN_ID"] = pd.to_numeric(sweep_df["SWEEP_RUN_ID"], errors="coerce")
+            sweep_df = sweep_df[sweep_df["SWEEP_RUN_ID"].notna()].copy()
+            sweep_df["__norm_id__"] = sweep_df["SWEEP_RUN_ID"].map(normalize_id_value)
 
-        combined = pd.concat(frames, ignore_index=True, sort=False)
+            missing_df = sweep_df[~sweep_df["__norm_id__"].isin(done_ids)].copy()
+            missing_df = missing_df.drop(columns=["__norm_id__"])
 
-        if "SWEEP_RUN_ID" in combined.columns:
-            combined = combined[combined["SWEEP_RUN_ID"].notna()]
-            combined = combined.drop_duplicates(subset=["SWEEP_RUN_ID"], keep="first")
-            combined = combined.sort_values("SWEEP_RUN_ID")
-        elif "RUN_ID" in combined.columns:
-            combined = combined.drop_duplicates(subset=["RUN_ID"], keep="first")
-            combined = combined.sort_values("RUN_ID")
+            total = len(sweep_df)
+            done = total - len(missing_df)
+            missing = len(missing_df)
+            line = f"{pt.upper()} {group_short}: total={total}, done={done}, missing={missing}, chunk_size={chunk_size}"
+            print(line)
+            summary_lines.append(line)
 
-        final_file.parent.mkdir(parents=True, exist_ok=True)
-        combined.to_excel(final_file, index=False)
-        print(f"Merged rows: {len(combined)}")
+            if missing == 0:
+                continue
 
+            for start in range(0, missing, chunk_size):
+                chunk_df = missing_df.iloc[start:start + chunk_size].copy()
+                chunk_id = global_chunk_id
+                pending_csv = pending_dir / f"resume_chunk_{chunk_id:06d}_{pt}_{group_short}.csv"
+                output_xlsx = POWERTRAINS[pt]["work_dir"] / f"{POWERTRAINS[pt]['result_prefix']}_{group_short}_resume_{chunk_id:06d}.xlsx"
+
+                chunk_df.to_csv(pending_csv, index=False)
+                ids = [normalize_id_value(v) for v in chunk_df["SWEEP_RUN_ID"].tolist()]
+                ids = [v for v in ids if v is not None]
+
+                rows.append({
+                    "chunk_id": chunk_id,
+                    "powertrain": pt,
+                    "group": group_short,
+                    "n_rows": len(chunk_df),
+                    "first_sweep_run_id": ids[0] if ids else "",
+                    "last_sweep_run_id": ids[-1] if ids else "",
+                    "source_sweep_file": str(sweep_file),
+                    "pending_csv": str(pending_csv),
+                    "output_xlsx": str(output_xlsx),
+                    "final_xlsx": str(final_file),
+                })
+                global_chunk_id += 1
+
+    fieldnames = [
+        "chunk_id", "powertrain", "group", "n_rows",
+        "first_sweep_run_id", "last_sweep_run_id",
+        "source_sweep_file", "pending_csv", "output_xlsx", "final_xlsx",
+    ]
+    with manifest_file.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    summary_lines.append(f"planned_chunks={len(rows)}")
+    summary_lines.append(f"manifest={manifest_file}")
+    summary_file.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    (plan_dir / "chunk_count.txt").write_text(str(len(rows)) + "\n", encoding="utf-8")
+
+    print("\n============================================================")
+    print("Resume plan created")
+    print("============================================================")
+    print(f"Plan dir       : {plan_dir}")
+    print(f"Manifest       : {manifest_file}")
+    print(f"Pending chunks : {len(rows)}")
+    print(f"Chunk size     : {chunk_size}")
+
+
+def load_resume_manifest(plan_dir: Path) -> list[dict]:
+    manifest_file = plan_dir / "manifest.csv"
+    if not manifest_file.exists():
+        raise FileNotFoundError(f"Resume manifest not found: {manifest_file}")
+    with manifest_file.open("r", newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def run_resume_manifest_worker(args: argparse.Namespace) -> None:
+    doe_file = SIM_DIR / "DoE_main_sensitivity.m"
+
+    if not SIM_DIR.exists():
+        raise FileNotFoundError(f"Simulation_Model folder not found: {SIM_DIR}")
+    if not doe_file.exists():
+        raise FileNotFoundError(f"Missing MATLAB file: {doe_file}")
+
+    plan_dir = Path(args.plan_dir).resolve()
+    manifest_rows = load_resume_manifest(plan_dir)
+    array_ctx = slurm_array_context()
+
+    if array_ctx is None:
+        actual_task_id = 1
+        task_index = 1
+        task_count = 1
+    else:
+        actual_task_id, task_index, task_count = array_ctx
+
+    assigned = [
+        row for row in manifest_rows
+        if ((int(row["chunk_id"]) - 1) % task_count) == (task_index - 1)
+    ]
+
+    print("\n============================================================")
+    print("Resume manifest worker")
+    print("============================================================")
+    print(f"Plan dir            : {plan_dir}")
+    print(f"Manifest chunks     : {len(manifest_rows)}")
+    print(f"SLURM task id       : {actual_task_id}")
+    print(f"Worker index/count  : {task_index}/{task_count}")
+    print(f"Assigned chunks     : {len(assigned)}")
+
+    if not assigned:
+        print("No chunks assigned to this worker. Nothing to do.")
+        return
+
+    for row in assigned:
+        chunk_id = int(row["chunk_id"])
+        pending_csv = Path(row["pending_csv"])
+        output_xlsx = Path(row["output_xlsx"])
+        n_rows = row.get("n_rows", "")
+
+        print("\n------------------------------------------------------------")
+        print(f"Resume chunk {chunk_id}")
+        print(f"Powertrain : {row.get('powertrain')}")
+        print(f"Group      : {row.get('group')}")
+        print(f"Rows       : {n_rows}")
+        print(f"Input CSV  : {display_path(pending_csv)}")
+        print(f"Output XLSX: {display_path(output_xlsx)}")
+
+        if not pending_csv.exists():
+            raise FileNotFoundError(f"Pending CSV not found: {pending_csv}")
+
+        # The pending CSV already contains only missing rows, so process the whole file.
+        # Existing output_xlsx is still resume-safe because DoE_main_sensitivity skips
+        # SWEEP_RUN_IDs already present inside that file.
+        run_one_matlab_job(args.matlab_exe, pending_csv, output_xlsx, args.dry_run)
 
 def run_matlab_sweeps(powertrains: Iterable[str], args: argparse.Namespace) -> None:
     doe_file = SIM_DIR / "DoE_main_sensitivity.m"
@@ -624,6 +944,10 @@ def cmd_post_sim(args: argparse.Namespace) -> None:
 
     for pt in pts:
         merge_chunk_outputs_for_powertrain(pt)
+
+        if not args.ignore_missing_results:
+            validate_final_results_for_powertrain(pt)
+
         missing = missing_result_files(pt, args)
 
         if missing and not args.ignore_missing_results:
@@ -634,6 +958,22 @@ def cmd_post_sim(args: argparse.Namespace) -> None:
 
         print(f"\n=== {pt.upper()}: analyze ===")
         run_analyze(pt, args)
+
+
+def cmd_plan_resume(args: argparse.Namespace) -> None:
+    pts = selected_powertrains(args.powertrain)
+    warn_if_not_venv(args)
+    ensure_paths(pts)
+    plan_resume_chunks(pts, args)
+
+
+def cmd_matlab_resume(args: argparse.Namespace) -> None:
+    pts = selected_powertrains(args.powertrain)
+    warn_if_not_venv(args)
+    ensure_paths(pts)
+    # pts is validated here so a wrong --powertrain fails early. The manifest itself
+    # carries the exact pending chunks.
+    run_resume_manifest_worker(args)
 
 
 def cmd_auto(args: argparse.Namespace) -> None:
@@ -670,7 +1010,7 @@ def cmd_auto(args: argparse.Namespace) -> None:
 
 
 def add_common_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--powertrain", choices=["ice", "hybrid", "bev", "both", "all"], default="all")
+    p.add_argument("--powertrain", choices=["hybrid", "bev", "both"], default="both")
     p.add_argument("--tolerance", type=float, default=0.10)
     p.add_argument("--input_csv", default=None)
     p.add_argument("--results_file", default=None)
@@ -690,8 +1030,22 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+def add_resume_plan_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--plan-dir",
+        default=str(ROOT / "logs" / "sensitivity_current_plan"),
+        help="Directory for the generated gap-based resume manifest and pending chunk CSVs.",
+    )
+    p.add_argument(
+        "--resume-chunk-size",
+        type=int,
+        default=int(os.environ.get("RESUME_CHUNK_SIZE", "10")),
+        help="Fixed number of missing sweep rows per generated resume chunk CSV.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Automate ICE/Hybrid/BEV sensitivity-analysis workflow.")
+    parser = argparse.ArgumentParser(description="Automate Hybrid/BEV sensitivity-analysis workflow.")
     sub = parser.add_subparsers(dest="cmd", required=False)
 
     p_setup = sub.add_parser("setup-venv")
@@ -704,6 +1058,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_matlab = sub.add_parser("matlab")
     add_common_args(p_matlab)
     p_matlab.set_defaults(func=cmd_matlab)
+
+    p_plan = sub.add_parser("plan-resume")
+    add_common_args(p_plan)
+    add_resume_plan_args(p_plan)
+    p_plan.set_defaults(func=cmd_plan_resume)
+
+    p_matlab_resume = sub.add_parser("matlab-resume")
+    add_common_args(p_matlab_resume)
+    add_resume_plan_args(p_matlab_resume)
+    p_matlab_resume.set_defaults(func=cmd_matlab_resume)
 
     p_post = sub.add_parser("post-sim")
     add_common_args(p_post)
@@ -721,7 +1085,7 @@ def normalize_argv() -> None:
     if len(sys.argv) <= 1:
         return
 
-    known_commands = {"setup-venv", "pre-sim", "matlab", "post-sim", "auto"}
+    known_commands = {"setup-venv", "pre-sim", "matlab", "plan-resume", "matlab-resume", "post-sim", "auto"}
 
     first = sys.argv[1]
 

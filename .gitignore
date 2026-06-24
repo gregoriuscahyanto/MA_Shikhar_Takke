@@ -4,3 +4,8 @@ Results*.mat
 *.slxc
 *.slx.autosave
 .venv/
+
+logs/
+
+sweep_results_**task*
+sweep_results_**resume*
