@@ -1,11 +1,65 @@
-% DoE_main.m - RUNNING AS A SCRIPT (Global Scope)
+% DoE_main.m - local + HPC capable DoE runner
+%
+% Local execution:
+%   cd("Simulation_Model/Krisna_20260625/20260625 - neuer Testlauf")
+%   run("DoE_main.m")
+%
+% HPC execution:
+%   DoE_hpc_worker assigns csv_filename/output_filename and runs this script in
+%   the MATLAB base workspace. The script therefore remains close to the
+%   original DoE_main logic, but supports local $TMPDIR execution and CSV output.
 
-% --- 0. SAFETY CHECK ---
-% If running locally for test, define defaults if variables don't exist
-if ~exist('TaskID', 'var'), TaskID = 1; end
+% Keep local execution robust: run relative paths from this script folder.
+script_dir = fileparts(mfilename('fullpath'));
+if ~isempty(script_dir)
+    cd(script_dir);
+end
+
+% --- 0. SAFETY CHECK / OPTIONAL HPC OVERRIDES ---
+if ~exist('TaskID', 'var') || isempty(TaskID), TaskID = 1; end
 if ~exist('ChunkSize', 'var'), ChunkSize = 1; end
+if ~exist('csv_filename', 'var') || isempty(csv_filename), csv_filename = fullfile('DoE', 'DoE_Inp_Hybrid.csv'); end
+if ~exist('output_filename', 'var') || isempty(output_filename), output_filename = fullfile('DoE', sprintf('Results_Chunk_%d.xlsx', TaskID)); end
+if ~exist('actual_values_filename', 'var') || isempty(actual_values_filename), actual_values_filename = fullfile('DoE', 'DoE_ActualValues_Hybrid.xlsx'); end
 
-fprintf('=== WORKER STARTED: TaskID %d | ChunkSize %d ===\n', TaskID, ChunkSize);
+if ~exist('DOE_HPC_MODE', 'var') || isempty(DOE_HPC_MODE), DOE_HPC_MODE = false; end
+if ~exist('DOE_KEEP_MODEL_LOADED', 'var') || isempty(DOE_KEEP_MODEL_LOADED), DOE_KEEP_MODEL_LOADED = false; end
+if ~exist('DOE_USE_FAST_RESTART', 'var') || isempty(DOE_USE_FAST_RESTART), DOE_USE_FAST_RESTART = false; end
+if ~exist('DOE_CLOSE_MODEL_AFTER_RUN', 'var') || isempty(DOE_CLOSE_MODEL_AFTER_RUN), DOE_CLOSE_MODEL_AFTER_RUN = false; end
+if ~exist('DOE_SL_MODEL_NAME', 'var') || isempty(DOE_SL_MODEL_NAME), DOE_SL_MODEL_NAME = 'Simulation_Fahrmodell_v4_straight_line'; end
+if ~exist('DOE_TEMP_ROOT', 'var'), DOE_TEMP_ROOT = ''; end
+if ~exist('DOE_MODEL_ROOT', 'var') || isempty(DOE_MODEL_ROOT), DOE_MODEL_ROOT = discoverModelRoot(script_dir); end
+if ~exist('DOE_ADD_ACTUAL_COMPARISON', 'var') || isempty(DOE_ADD_ACTUAL_COMPARISON)
+    [~, ~, outExt] = fileparts(char(string(output_filename)));
+    DOE_ADD_ACTUAL_COMPARISON = strcmpi(outExt, '.xlsx');
+end
+
+DOE_HPC_MODE = logical(DOE_HPC_MODE);
+DOE_KEEP_MODEL_LOADED = logical(DOE_KEEP_MODEL_LOADED);
+DOE_USE_FAST_RESTART = logical(DOE_USE_FAST_RESTART);
+DOE_CLOSE_MODEL_AFTER_RUN = logical(DOE_CLOSE_MODEL_AFTER_RUN);
+DOE_ADD_ACTUAL_COMPARISON = logical(DOE_ADD_ACTUAL_COMPARISON);
+
+fprintf('=== DoE_main STARTED: TaskID %d | ChunkSize %s ===\n', TaskID, mat2str(ChunkSize));
+fprintf('Input file : %s\n', char(string(csv_filename)));
+fprintf('Output file: %s\n', char(string(output_filename)));
+fprintf('HPC mode   : %d\n', DOE_HPC_MODE);
+
+% Keep Simulink generated files off HOME/shared FS when DOE_TEMP_ROOT is set.
+if strlength(string(DOE_TEMP_ROOT)) > 0
+    try
+        cacheFolder = fullfile(char(string(DOE_TEMP_ROOT)), 'simulink_cache');
+        codegenFolder = fullfile(char(string(DOE_TEMP_ROOT)), 'simulink_codegen');
+        Simulink.fileGenControl('set', ...
+            'CacheFolder', cacheFolder, ...
+            'CodeGenFolder', codegenFolder, ...
+            'createDir', true);
+        fprintf('Simulink CacheFolder : %s\n', cacheFolder);
+        fprintf('Simulink CodeGenFolder: %s\n', codegenFolder);
+    catch ME
+        fprintf('WARNING: Could not set Simulink file generation folders: %s\n', ME.message);
+    end
+end
 
 % Add Folders to Path
 addpath(genpath("Config Scripts"))
@@ -14,27 +68,78 @@ addpath(genpath("Future"))
 addpath(genpath("init_NBR Scripts"))
 addpath(genpath("Reference Drive Cycle"))
 addpath(genpath("Simulation Scripts"))
+if strlength(string(DOE_MODEL_ROOT)) > 0 && isfolder(char(string(DOE_MODEL_ROOT)))
+    addpath(genpath(char(string(DOE_MODEL_ROOT))), '-end');
+    addpath(genpath(script_dir), '-begin');
+    fprintf('Simulation_Model root: %s\n', char(string(DOE_MODEL_ROOT)));
+end
+
+% Load the straight-line model once without opening the Simulink UI.
+% In HPC mode this stays loaded across chunks because DoE_hpc_worker runs
+% several chunks in the same MATLAB process.
+DOE_SL_MODEL_FILE = locateSimulinkModel(DOE_SL_MODEL_NAME, script_dir, DOE_MODEL_ROOT);
+if isempty(DOE_SL_MODEL_FILE)
+    error(['Could not find required Simulink model %s(.slx/.mdl).\n', ...
+           'Searched current folder, MATLAB path, script folder, and Simulation_Model root.\n', ...
+           'script_dir=%s\nDOE_MODEL_ROOT=%s'], ...
+           char(string(DOE_SL_MODEL_NAME)), script_dir, char(string(DOE_MODEL_ROOT)));
+end
+[~, DOE_SL_MODEL_SIM_NAME, ~] = fileparts(DOE_SL_MODEL_FILE);
+fprintf('Simulink model file: %s\n', DOE_SL_MODEL_FILE);
+try
+    if ~bdIsLoaded(DOE_SL_MODEL_SIM_NAME)
+        load_system(DOE_SL_MODEL_FILE);
+        fprintf('Loaded Simulink model once: %s\n', DOE_SL_MODEL_SIM_NAME);
+    end
+    if DOE_USE_FAST_RESTART
+        try
+            set_param(DOE_SL_MODEL_SIM_NAME, 'FastRestart', 'on');
+            fprintf('FastRestart enabled for %s\n', DOE_SL_MODEL_SIM_NAME);
+        catch MEfr
+            fprintf('WARNING: Could not enable FastRestart: %s\n', MEfr.message);
+        end
+    else
+        % DoE rows can change gearbox map dimensions, e.g. 8 gears -> 7 gears.
+        % Fast Restart would keep the model compiled and then reject these
+        % dimension changes. Keep the model loaded, but do not keep the compiled
+        % FastRestart state across simulations.
+        try
+            set_param(DOE_SL_MODEL_SIM_NAME, 'FastRestart', 'off');
+            fprintf('FastRestart disabled for variable-dimension DoE rows.\n');
+        catch MEfrOff
+            fprintf('WARNING: Could not disable FastRestart: %s\n', MEfrOff.message);
+        end
+    end
+catch MEload
+    error('Could not load Simulink model file %s: %s', DOE_SL_MODEL_FILE, MEload.message);
+end
 
 % --- 1. INITIALIZATION ---
-% Since this is a script, this runs in Base Workspace automatically.
-% Simulink will see EVERYTHING created here.
+% This is intentionally still script-style. When run locally it is the base
+% workspace; when run by DoE_hpc_worker it is executed via evalin('base', ...).
 if ~exist('Track', 'var')
     fprintf("Running init_NBR...\n");
-    init_NBR(); 
+    init_NBR();
 end
 
 % --- 2. LOAD CONFIGURATIONS ---
-csv_filename = 'DoE_Inp_Hybrid.csv'; 
-if isempty(which(csv_filename))
-    error('Config file %s not found.', csv_filename);
+if isempty(which(csv_filename)) && ~isfile(csv_filename)
+    error('Config file %s not found.', char(string(csv_filename)));
 end
 
 all_configs = loadConfig(csv_filename);
 total_configs = length(all_configs);
 
 % --- 3. DETERMINE LOOP RANGE ---
-start_idx = (TaskID - 1) * ChunkSize + 1;
-end_idx   = start_idx + ChunkSize - 1;
+% If ChunkSize is empty, process the complete input CSV. This is used by the
+% dynamic HPC worker because it passes already-small chunk CSVs.
+if isempty(ChunkSize)
+    start_idx = 1;
+    end_idx = total_configs;
+else
+    start_idx = (TaskID - 1) * ChunkSize + 1;
+    end_idx   = start_idx + ChunkSize - 1;
+end
 
 if start_idx > total_configs
     fprintf('Start index %d > Total configs %d. Exiting.\n', start_idx, total_configs);
@@ -44,7 +149,7 @@ if end_idx > total_configs, end_idx = total_configs; end
 
 fprintf('Processing Rows %d to %d\n', start_idx, end_idx);
 
-results_struct = []; 
+results_struct = [];
 
 % --- 4. MAIN SIMULATION LOOP ---
 for i = start_idx:end_idx
@@ -152,15 +257,18 @@ for i = start_idx:end_idx
     gb.mode = string(cfg.mode); 
     gb.shiftDelay = cfg.shiftDelay;
     gb.use_cus_val = logical(cfg.use_cus_val);
-    if ischar(cfg.Gear_Ratio) || isstring(cfg.Gear_Ratio)
-        gb.Gear_Ratio = str2num(cfg.Gear_Ratio); 
-    else
-        gb.Gear_Ratio = cfg.Gear_Ratio;
-    end
+    gb.Gear_Ratio = parseNumericVector(cfg.Gear_Ratio);
     gb.No_Gears = cfg.No_Gears;
-    gb.Gears = 1:gb.No_Gears;
+    if ~isempty(gb.Gear_Ratio)
+        gb.No_Gears = numel(gb.Gear_Ratio);
+    end
+    gb.Gears = 1:max(0, gb.No_Gears);
     gb.pedal_pos = 0:0.1:1;
     if cfg.VM || cfg.Hy == 1
+        if isempty(gb.Gear_Ratio) || gb.No_Gears < 1
+            fprintf('WARNING RunID %d: Gear_Ratio/No_Gears missing although VM/Hy active. Using GearboxConfig.computeRatios() defaults.\n', runID);
+            gb = gb.computeRatios();
+        end
         gb = gb.computeShiftMaps();
     end
 
@@ -229,7 +337,7 @@ for i = start_idx:end_idx
     %% === RUN SIMULATION 2: Straight Line Model ===
     simOut_SL = [];
     try
-        simOut_SL = sim('Simulation_Fahrmodell_v3_straight_line.slx');
+        simOut_SL = sim(DOE_SL_MODEL_SIM_NAME);
     catch ME
         fprintf('!!! CRITICAL ERROR SL Model (RunID: %d) !!!\n', runID);
         fprintf('%s\n', getReport(ME, 'extended', 'hyperlinks', 'off'));
@@ -251,12 +359,108 @@ for i = start_idx:end_idx
 end % End Loop
 
 %% === SAVE RESULTS ===
-output_filename = sprintf('Results_Chunk_%d.mat', TaskID);
-fprintf('Saving %d runs to %s...\n', length(results_struct), output_filename);
-save(output_filename, 'results_struct');
+if isempty(results_struct)
+    results_table = table();
+else
+    results_table = struct2table(results_struct);
+    if DOE_ADD_ACTUAL_COMPARISON
+        results_table = addActualComparison(results_table, actual_values_filename);
+    end
+end
+
+outFolder = fileparts(char(string(output_filename)));
+if ~isempty(outFolder) && ~exist(outFolder, 'dir')
+    mkdir(outFolder);
+end
+
+fprintf('Saving %d runs to %s...\n', height(results_table), char(string(output_filename)));
+writetable(results_table, output_filename);
 fprintf('Task %d Done.\n', TaskID);
 
+% In HPC mode the model intentionally stays loaded for the next chunk.
+if ~DOE_KEEP_MODEL_LOADED
+    if DOE_USE_FAST_RESTART && exist('DOE_SL_MODEL_SIM_NAME', 'var') && bdIsLoaded(DOE_SL_MODEL_SIM_NAME)
+        try
+            set_param(DOE_SL_MODEL_SIM_NAME, 'FastRestart', 'off');
+        catch
+        end
+    end
+    if DOE_CLOSE_MODEL_AFTER_RUN && exist('DOE_SL_MODEL_SIM_NAME', 'var') && bdIsLoaded(DOE_SL_MODEL_SIM_NAME)
+        try
+            close_system(DOE_SL_MODEL_SIM_NAME, 0);
+        catch
+        end
+    end
+end
+
 %% === HELPER FUNCTIONS (Must be at bottom of script) ===
+
+
+function model_root = discoverModelRoot(script_dir)
+    model_root = '';
+    if isempty(script_dir), script_dir = pwd; end
+    current = char(string(script_dir));
+    for k = 1:8
+        [parent, name] = fileparts(current);
+        if strcmp(name, 'Simulation_Model')
+            model_root = current;
+            return;
+        end
+        if isempty(parent) || strcmp(parent, current)
+            break;
+        end
+        current = parent;
+    end
+end
+
+function model_file = locateSimulinkModel(model_name, script_dir, model_root)
+    model_file = '';
+    model_name = char(erase(string(model_name), '.slx'));
+    model_name = char(erase(string(model_name), '.mdl'));
+
+    candidates = {};
+    direct = char(string(model_name));
+    if isfile(direct), candidates{end+1} = direct; end %#ok<AGROW>
+    if isfile([direct '.slx']), candidates{end+1} = [direct '.slx']; end %#ok<AGROW>
+    if isfile([direct '.mdl']), candidates{end+1} = [direct '.mdl']; end %#ok<AGROW>
+
+    w = which([model_name '.slx']); if ~isempty(w), candidates{end+1} = w; end %#ok<AGROW>
+    w = which([model_name '.mdl']); if ~isempty(w), candidates{end+1} = w; end %#ok<AGROW>
+    w = which(model_name); if ~isempty(w), candidates{end+1} = w; end %#ok<AGROW>
+
+    roots = unique(string({pwd, script_dir, char(string(model_root))}), 'stable');
+    for r = 1:numel(roots)
+        root = char(roots(r));
+        if isempty(root) || ~isfolder(root), continue; end
+        hits = [dir(fullfile(root, '**', [model_name '.slx'])); dir(fullfile(root, '**', [model_name '.mdl']))];
+        for h = 1:numel(hits)
+            candidates{end+1} = fullfile(hits(h).folder, hits(h).name); %#ok<AGROW>
+        end
+    end
+
+    for c = 1:numel(candidates)
+        if isfile(candidates{c})
+            model_file = candidates{c};
+            return;
+        end
+    end
+end
+
+function v = parseNumericVector(x)
+    if ischar(x) || isstring(x)
+        v = str2num(char(x)); %#ok<ST2NM>
+    elseif isnumeric(x)
+        v = x;
+    else
+        v = [];
+    end
+    if isempty(v)
+        v = [];
+        return;
+    end
+    v = double(v(:)).';
+    v = v(isfinite(v));
+end
 
 function current_result = extractVars(simOut, varNames, current_result, prefix)
     % (Same as before)
@@ -291,6 +495,64 @@ end
 function all_configs = loadConfig(filename)
     T = readtable(filename);
     all_configs = table2struct(T);
+end
+
+
+function results_table = addActualComparison(results_table, actual_values_filename)
+    % Adds ActualValues and error columns when DoE_ActualValues_Hybrid.xlsx is available.
+    if isempty(results_table) || ~ismember('RUN_ID', results_table.Properties.VariableNames)
+        return;
+    end
+
+    actualFile = char(string(actual_values_filename));
+    if isempty(actualFile) || ~isfile(actualFile)
+        fprintf('Actual values file not found or not set. Skipping comparison columns.\n');
+        return;
+    end
+
+    try
+        actualT = readtable(actualFile, 'VariableNamingRule', 'preserve');
+    catch
+        actualT = readtable(actualFile);
+    end
+
+    actualVars = actualT.Properties.VariableNames;
+    runCol = find(strcmpi(actualVars, 'RUN_ID'), 1);
+    if isempty(runCol)
+        fprintf('Actual values file has no RUN_ID column. Skipping comparison columns.\n');
+        return;
+    end
+
+    actualCol = find(contains(lower(actualVars), 'actual') & contains(actualVars, '100'), 1);
+    if isempty(actualCol)
+        candidateCols = setdiff(1:numel(actualVars), runCol);
+        if isempty(candidateCols)
+            fprintf('Actual values file has no value column. Skipping comparison columns.\n');
+            return;
+        end
+        actualCol = candidateCols(1);
+    end
+
+    resultRunIDs = str2double(string(results_table.RUN_ID));
+    actualRunIDs = str2double(string(actualT{:, runCol}));
+    actualVals = str2double(string(actualT{:, actualCol}));
+
+    [tf, loc] = ismember(resultRunIDs, actualRunIDs);
+    results_table.Actual_0_to_100_s = NaN(height(results_table), 1);
+    results_table.Actual_0_to_100_s(tf) = actualVals(loc(tf));
+
+    simCol = '';
+    if ismember('SL_time_0_to_100', results_table.Properties.VariableNames)
+        simCol = 'SL_time_0_to_100';
+    elseif ismember('time_0_to_100', results_table.Properties.VariableNames)
+        simCol = 'time_0_to_100';
+    end
+
+    if ~isempty(simCol)
+        simVals = str2double(string(results_table.(simCol)));
+        results_table.Error_0_to_100_s = simVals - results_table.Actual_0_to_100_s;
+        results_table.Error_0_to_100_pct = 100 .* results_table.Error_0_to_100_s ./ results_table.Actual_0_to_100_s;
+    end
 end
 
 function mainStruct = appendStruct(mainStruct, newStruct)

@@ -9,3 +9,5 @@ logs/
 
 sweep_results_**task*
 sweep_results_**resume*
+
+DoE_chunk_*.csv

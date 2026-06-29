@@ -166,19 +166,22 @@ for i = start_idx:end_idx
 
     % --- Powertrain Config ---
     pt = PowertrainConfig();
-    pt.VM = cfg.VM; pt.EV = cfg.EV; pt.Hy = cfg.Hy;
-    pt.P0 = cfg.P0; pt.P2 = cfg.P2; pt.P3 = cfg.P3;
-    pt.P4 = cfg.P4; pt.P4_DM = cfg.P4_DM;
+    pt.VM = cfg.VM;
+    pt.EV = cfg.EV;
+    pt.Hy = cfg.Hy;
     
-    % ----------------------------------------------------EV----------------
-    % Enable EV
-    %pt.E0 = cfg.E0;
-    %pt.E1 = cfg.E1;
-    %pt.E2 = cfg.E2;
-    %pt.E3 = cfg.E3;
-    %pt.E4 = cfg.E4;
-    % ----------------------------------------------------EV----------------
+    pt.P0 = cfg.P0;
+    pt.P2 = cfg.P2;
+    pt.P3 = cfg.P3;
+    pt.P4 = cfg.P4;
+    pt.P4_DM = cfg.P4_DM;
     
+    pt.E0 = 0; if isfield(cfg, 'E0'), pt.E0 = cfg.E0; end
+    pt.E1 = 0; if isfield(cfg, 'E1'), pt.E1 = cfg.E1; end
+    pt.E2 = 0; if isfield(cfg, 'E2'), pt.E2 = cfg.E2; end
+    pt.E3 = 0; if isfield(cfg, 'E3'), pt.E3 = cfg.E3; end
+    pt.E4 = 0; if isfield(cfg, 'E4'), pt.E4 = cfg.E4; end
+
     pt = pt.setupEV();
     pt = pt.setupHybrid();
 
@@ -231,8 +234,6 @@ for i = start_idx:end_idx
         fprintf('!!! CRITICAL ERROR SL Model (RunID: %d) !!!\n', runID);
         fprintf('%s\n', getReport(ME, 'extended', 'hyperlinks', 'off'));
     end
-
-    
 
     % Extract SL
     vars_SL = {'time_0_to_100', 'time_0_to_200', 'time_80_to_120', 'time_60_to_120', 'max_speed', 'max_launch_acc'};
