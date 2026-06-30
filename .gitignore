@@ -18,5 +18,4 @@ _alt/
 legacy_shell_scripts/
 legacy_slurm_scripts/
 
-
 *.asv
