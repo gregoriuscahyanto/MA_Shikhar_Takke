@@ -15,18 +15,35 @@ if ~isempty(script_dir)
     cd(script_dir);
 end
 
+% default_doe         	= 'DoE_Inp_Hybrid_random5.csv';
+% default_actualvalues    = 'DoE_ActualValues_Hybrid.xlsx';
+
+default_doe         	= 'DoE_Inp_ICE_random20.csv';
+default_actualvalues    = 'DoE_ActualValues_ICE.xlsx';
+
+default_sim             = 'Simulation_Fahrmodell_v4_straight_line';
+
+% Get default chunk from table height
+try
+    temp_T = readtable(fullfile('DoE', default_doe));
+    default_chunk = height(temp_T);
+    clear temp_T
+catch
+    default_chunk = 1;
+end
+
 % --- 0. SAFETY CHECK / OPTIONAL HPC OVERRIDES ---
 if ~exist('TaskID', 'var') || isempty(TaskID), TaskID = 1; end
-if ~exist('ChunkSize', 'var'), ChunkSize = 1; end
-if ~exist('csv_filename', 'var') || isempty(csv_filename), csv_filename = fullfile('DoE', 'DoE_Inp_Hybrid RunID224.csv'); end
+if ~exist('ChunkSize', 'var'), ChunkSize = default_chunk; end
+if ~exist('csv_filename', 'var') || isempty(csv_filename), csv_filename = fullfile('DoE', default_doe); end
 if ~exist('output_filename', 'var') || isempty(output_filename), output_filename = fullfile('DoE', sprintf('Results_Chunk_%d.xlsx', TaskID)); end
-if ~exist('actual_values_filename', 'var') || isempty(actual_values_filename), actual_values_filename = fullfile('DoE', 'DoE_ActualValues_Hybrid.xlsx'); end
+if ~exist('actual_values_filename', 'var') || isempty(actual_values_filename), actual_values_filename = fullfile('DoE', default_actualvalues); end
 
 if ~exist('DOE_HPC_MODE', 'var') || isempty(DOE_HPC_MODE), DOE_HPC_MODE = false; end
 if ~exist('DOE_KEEP_MODEL_LOADED', 'var') || isempty(DOE_KEEP_MODEL_LOADED), DOE_KEEP_MODEL_LOADED = false; end
 if ~exist('DOE_USE_FAST_RESTART', 'var') || isempty(DOE_USE_FAST_RESTART), DOE_USE_FAST_RESTART = false; end
 if ~exist('DOE_CLOSE_MODEL_AFTER_RUN', 'var') || isempty(DOE_CLOSE_MODEL_AFTER_RUN), DOE_CLOSE_MODEL_AFTER_RUN = false; end
-if ~exist('DOE_SL_MODEL_NAME', 'var') || isempty(DOE_SL_MODEL_NAME), DOE_SL_MODEL_NAME = 'Simulation_Fahrmodell_v4_straight_line'; end
+if ~exist('DOE_SL_MODEL_NAME', 'var') || isempty(DOE_SL_MODEL_NAME), DOE_SL_MODEL_NAME = default_sim; end
 if ~exist('DOE_TEMP_ROOT', 'var'), DOE_TEMP_ROOT = ''; end
 if ~exist('DOE_MODEL_ROOT', 'var') || isempty(DOE_MODEL_ROOT), DOE_MODEL_ROOT = discoverModelRoot(script_dir); end
 if ~exist('DOE_ADD_ACTUAL_COMPARISON', 'var') || isempty(DOE_ADD_ACTUAL_COMPARISON)
@@ -150,6 +167,23 @@ if end_idx > total_configs, end_idx = total_configs; end
 fprintf('Processing Rows %d to %d\n', start_idx, end_idx);
 
 results_struct = [];
+
+%% Prepare to save for Debug only if not HPC Mode
+if ~DOE_HPC_MODE
+    % Get actual datetime
+    actual_datetime = string(datetime("now", "Format", "yyyyMMdd_HHmmss"));
+
+    % Create main folder if not yet exist
+    save_dir_local = "Export_Debug_local";
+    if ~exist(save_dir_local, 'dir')
+        mkdir(save_dir_local)
+    end
+
+    % Create save folder
+    save_dir = fullfile(save_dir_local, actual_datetime);
+    mkdir(save_dir)
+
+end
 
 % --- 4. MAIN SIMULATION LOOP ---
 for i = start_idx:end_idx
@@ -368,107 +402,109 @@ for i = start_idx:end_idx
     
     %% Save to .mat for Debug only if not HPC Mode
     if ~DOE_HPC_MODE
-        % Get actual datetime
-        actual_datetime = string(datetime("now", "Format", "yyyyMMdd_HHmmss"));
-
-        % Create main folder if not yet exist
-        save_dir_local = "Export_Debug_local";
-        if ~exist(save_dir_local, 'dir')
-            mkdir(save_dir_local)
-        end
-
-        % Create save folder
-        save_dir = fullfile(save_dir_local, actual_datetime);
-        mkdir(save_dir)
-
         % Save log as .mat file to folder
         filename = "log_" + ...
             actual_datetime + "_" + ...
             "runID" + string(runID) + ... 
             ".mat";
         save(fullfile(save_dir, filename), "simOut_SL", "-mat");
-        
-        % Copy DoE csv to folder
-        copyfile(csv_filename, save_dir);
-
-        % Copy slx file to folder
-        copyfile(DOE_SL_MODEL_FILE, save_dir);
-        % [~, filename, ext] = fileparts(DOE_SL_MODEL_FILE);
-        % new_filename = filename + "_copy" + ext;
-        % old_filename = [filename, ext];
-        % movefile(fullfile(save_dir, old_filename), fullfile(save_dir, new_filename)); 
-
-        % Copy DoE .m to folder
-        copyfile("DoE_main.m", save_dir);
-        
-        % Save results table to folder
-        filename = "results_" + actual_datetime + "_" + ...
-            "runID" + string(runID) + ... 
-            ".xlsx";
-        results_table = struct2table(current_result);
-        if DOE_ADD_ACTUAL_COMPARISON
-            results_table = addActualComparison(results_table, actual_values_filename);
-        end
-        writetable(results_table, fullfile(save_dir, filename));
-
-        % .zip erstellen
-        save_dir = string(save_dir);
-        [parentFolder, zipName] = fileparts(save_dir);
-        zipFile = fullfile(parentFolder, zipName + ".zip");
-        % Inhalte des Ordners sammeln, aber "." und ".." ausschließen
-        d = dir(save_dir);
-        names = {d.name};
-        names = names(~ismember(names, {'.', '..'}));
-        % ZIP erstellen: Inhalte relativ zu save_dir packen
-        zip(zipFile, names, save_dir);
-
-        % Delete folder
-        if isfile(zipFile)
-            rmdir(char(save_dir), 's');
-            fprintf('ZIP erstellt und Ordner gelöscht:\n%s\n', zipFile);
-        else
-            warning('ZIP wurde nicht erstellt. Ordner wurde nicht gelöscht.');
-        end
-        
-
     end
 
 end % End Loop
 
-%% === SAVE RESULTS ===
-if isempty(results_struct)
-    results_table = table();
-else
+%% Save to .mat for Debug only if not HPC Mode
+if ~DOE_HPC_MODE
+    
+    % Copy DoE csv to folder
+    copyfile(csv_filename, save_dir);
+
+    % Copy slx file to folder
+    copyfile(DOE_SL_MODEL_FILE, save_dir);
+    % [~, filename, ext] = fileparts(DOE_SL_MODEL_FILE);
+    % new_filename = filename + "_copy" + ext;
+    % old_filename = [filename, ext];
+    % movefile(fullfile(save_dir, old_filename), fullfile(save_dir, new_filename)); 
+
+    % Copy DoE .m to folder
+    copyfile("DoE_main.m", save_dir);
+    
+    % Save results table to folder
+    filename = "results_" + actual_datetime + "_" + ...
+        "runID" + string(runID) + ... 
+        ".xlsx";
     results_table = struct2table(results_struct);
     if DOE_ADD_ACTUAL_COMPARISON
         results_table = addActualComparison(results_table, actual_values_filename);
     end
+    results_file = fullfile(save_dir, filename);
+    writetable(results_table, results_file);
+
+    % Create comparison plot before zipping/deleting the debug folder.
+    % The plot is only created when Actual_0_to_100_s and SL_time_0_to_100 are available.
+    plot_filename = "Actual_vs_Simulated_0_to_100.png";
+    plot_file = fullfile(save_dir, plot_filename);
+    createActualVsSim0100Plot(results_table, plot_file);
+
+    % .zip erstellen
+    save_dir = string(save_dir);
+    [parentFolder, zipName] = fileparts(save_dir);
+    zipFile = fullfile(parentFolder, zipName + ".zip");
+    % Inhalte des Ordners sammeln, aber "." und ".." ausschließen
+    d = dir(save_dir);
+    names = {d.name};
+    names = names(~ismember(names, {'.', '..'}));
+    % ZIP erstellen: Inhalte relativ zu save_dir packen
+    zip(zipFile, names, save_dir);
+
+    % Delete folder
+    if isfile(zipFile)
+        rmdir(char(save_dir), 's');
+        fprintf('ZIP erstellt und Ordner gelöscht:\n%s\n', zipFile);
+    else
+        warning('ZIP wurde nicht erstellt. Ordner wurde nicht gelöscht.');
+    end
+
 end
 
-outFolder = fileparts(char(string(output_filename)));
-if ~isempty(outFolder) && ~exist(outFolder, 'dir')
-    mkdir(outFolder);
-end
+%% === SAVE RESULTS if HPC MODE ===
+if DOE_HPC_MODE
 
-fprintf('Saving %d runs to %s...\n', height(results_table), char(string(output_filename)));
-writetable(results_table, output_filename);
-fprintf('Task %d Done.\n', TaskID);
-
-% In HPC mode the model intentionally stays loaded for the next chunk.
-if ~DOE_KEEP_MODEL_LOADED
-    if DOE_USE_FAST_RESTART && exist('DOE_SL_MODEL_SIM_NAME', 'var') && bdIsLoaded(DOE_SL_MODEL_SIM_NAME)
-        try
-            set_param(DOE_SL_MODEL_SIM_NAME, 'FastRestart', 'off');
-        catch
+    if isempty(results_struct)
+        results_table = table();
+    else
+        results_table = struct2table(results_struct);
+        if DOE_ADD_ACTUAL_COMPARISON
+            results_table = addActualComparison(results_table, actual_values_filename);
         end
     end
-    if DOE_CLOSE_MODEL_AFTER_RUN && exist('DOE_SL_MODEL_SIM_NAME', 'var') && bdIsLoaded(DOE_SL_MODEL_SIM_NAME)
-        try
-            close_system(DOE_SL_MODEL_SIM_NAME, 0);
-        catch
+    
+    outFolder = fileparts(char(string(output_filename)));
+    if ~isempty(outFolder) && ~exist(outFolder, 'dir')
+        mkdir(outFolder);
+    end
+    
+    fprintf('Saving %d runs to %s...\n', height(results_table), char(string(output_filename)));
+    writetable(results_table, output_filename);
+    fprintf('Task %d Done.\n', TaskID);
+    
+    % In HPC mode the model intentionally stays loaded for the next chunk.
+    if ~DOE_KEEP_MODEL_LOADED
+        if DOE_USE_FAST_RESTART && exist('DOE_SL_MODEL_SIM_NAME', 'var') && bdIsLoaded(DOE_SL_MODEL_SIM_NAME)
+            try
+                set_param(DOE_SL_MODEL_SIM_NAME, 'FastRestart', 'off');
+            catch
+            end
+        end
+        if DOE_CLOSE_MODEL_AFTER_RUN && exist('DOE_SL_MODEL_SIM_NAME', 'var') && bdIsLoaded(DOE_SL_MODEL_SIM_NAME)
+            try
+                close_system(DOE_SL_MODEL_SIM_NAME, 0);
+            catch
+            end
         end
     end
+
 end
+
 
 %% === HELPER FUNCTIONS (Must be at bottom of script) ===
 
@@ -645,3 +681,126 @@ function mainStruct = appendStruct(mainStruct, newStruct)
     end
     mainStruct = [mainStruct; newStruct];
 end
+
+function createActualVsSim0100Plot(results_table, output_file)
+    % Creates an Actual-vs-Simulated 0-100 km/h comparison plot.
+    % Intended for the local debug export folder before ZIP creation.
+
+    if isempty(results_table) || height(results_table) < 1
+        fprintf('No results available. Skipping 0-100 comparison plot.\n');
+        return;
+    end
+
+    varNames = results_table.Properties.VariableNames;
+
+    if ~ismember('Actual_0_to_100_s', varNames)
+        fprintf('Actual_0_to_100_s not available. Skipping 0-100 comparison plot.\n');
+        return;
+    end
+
+    if ismember('SL_time_0_to_100', varNames)
+        simCol = 'SL_time_0_to_100';
+    elseif ismember('time_0_to_100', varNames)
+        simCol = 'time_0_to_100';
+    else
+        fprintf('Simulated 0-100 column not available. Skipping 0-100 comparison plot.\n');
+        return;
+    end
+
+    actual = str2double(string(results_table.Actual_0_to_100_s));
+    simVal = str2double(string(results_table.(simCol)));
+
+    valid = isfinite(actual) & isfinite(simVal) & actual > 0 & simVal > 0;
+    actual = actual(valid);
+    simVal = simVal(valid);
+
+    if isempty(actual)
+        fprintf('No valid Actual/Simulated 0-100 values. Skipping comparison plot.\n');
+        return;
+    end
+
+    within10 = abs(simVal - actual) <= 0.10 .* actual;
+    nValid = numel(actual);
+    nPass = sum(within10);
+    passRate = 100 * nPass / nValid;
+
+    maxVal = max([actual; simVal]);
+    axisMax = ceil(maxVal * 1.05);
+    if axisMax < 5
+        axisMax = 5;
+    end
+    axisMin = 0;
+    xLine = linspace(axisMin, axisMax, 200);
+
+    fig = figure('Visible', 'off', 'Color', 'w', 'Position', [100 100 1100 950]);
+    hold on;
+
+    % Scatter groups. Colors match the intended readable green/orange style.
+    if any(within10)
+        scatter(actual(within10), simVal(within10), 55, ...
+            'MarkerFaceColor', [0.20 0.78 0.45], ...
+            'MarkerEdgeColor', 'w', ...
+            'MarkerFaceAlpha', 0.85, ...
+            'DisplayName', sprintf('Within 10%% Tolerance (%d runs)', nPass));
+    else
+        scatter(NaN, NaN, 55, ...
+            'MarkerFaceColor', [0.20 0.78 0.45], ...
+            'MarkerEdgeColor', 'w', ...
+            'DisplayName', 'Within 10% Tolerance (0 runs)');
+    end
+
+    nFail = nValid - nPass;
+    if any(~within10)
+        scatter(actual(~within10), simVal(~within10), 55, ...
+            'MarkerFaceColor', [0.93 0.45 0.12], ...
+            'MarkerEdgeColor', 'w', ...
+            'MarkerFaceAlpha', 0.85, ...
+            'DisplayName', sprintf('Outside 10%% Tolerance (%d runs)', nFail));
+    else
+        scatter(NaN, NaN, 55, ...
+            'MarkerFaceColor', [0.93 0.45 0.12], ...
+            'MarkerEdgeColor', 'w', ...
+            'DisplayName', 'Outside 10% Tolerance (0 runs)');
+    end
+
+    plot(xLine, xLine, ':', 'Color', [0.10 0.18 0.28], 'LineWidth', 3, ...
+        'DisplayName', 'Perfect Match (y = x)');
+    plot(xLine, 1.10 .* xLine, '--', 'Color', [0.00 0.45 0.74], 'LineWidth', 2.2, ...
+        'DisplayName', '±10% Tolerance Bands');
+    plot(xLine, 0.90 .* xLine, '--', 'Color', [0.00 0.45 0.74], 'LineWidth', 2.2, ...
+        'HandleVisibility', 'off');
+
+    grid on;
+    box on;
+    axis([axisMin axisMax axisMin axisMax]);
+    axis square;
+
+    title('Actual vs Simulated 0-100 km/h Time', 'FontSize', 22, 'FontWeight', 'bold');
+    xlabel('Actual 0 to 100 km/h Time (seconds)', 'FontSize', 15);
+    ylabel('Simulated 0 to 100 km/h Time (seconds)', 'FontSize', 15);
+    set(gca, 'FontSize', 13);
+
+    lgd = legend('Location', 'northwest');
+    set(lgd, 'FontSize', 13);
+
+    txt = sprintf('Pass Rate: %.1f%%\n(%d / %d runs)', passRate, nPass, nValid);
+    text(0.98, 0.04, txt, ...
+        'Units', 'normalized', ...
+        'HorizontalAlignment', 'right', ...
+        'VerticalAlignment', 'bottom', ...
+        'FontSize', 14, ...
+        'BackgroundColor', 'w', ...
+        'EdgeColor', [0.65 0.65 0.65], ...
+        'LineWidth', 1.2, ...
+        'Margin', 8);
+
+    try
+        exportgraphics(fig, output_file, 'Resolution', 200);
+    catch
+        print(fig, output_file, '-dpng', '-r200');
+    end
+    close(fig);
+
+    fprintf('0-100 comparison plot saved:\n%s\n', char(string(output_file)));
+end
+
