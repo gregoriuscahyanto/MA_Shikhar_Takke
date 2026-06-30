@@ -255,7 +255,7 @@ for i = start_idx:end_idx
     gb.i_ges_P4 = cfg.i_ges_P4;
     gb.max_rpm = cfg.n_ICE_max;
     gb.mode = string(cfg.mode); 
-    % gb.shiftDelay = cfg.shiftDelay; % nicht aus CSV übernehmen!
+    gb.shiftDelay = cfg.shiftDelay;
     gb.use_cus_val = logical(cfg.use_cus_val);
     gb.Gear_Ratio = parseNumericVector(cfg.Gear_Ratio);
     gb.No_Gears = cfg.No_Gears;
@@ -270,16 +270,6 @@ for i = start_idx:end_idx
             gb = gb.computeRatios();
         end
         gb = gb.computeShiftMaps();
-    end
-
-    % ShiftDelay 
-    [gb.shiftDelay, shiftSrc, gbType, p2w] = resolveShiftDelay(cfg);
-    if isfield(cfg, 'RUN_ID')
-        fprintf('RunID %d: shiftDelay = %.3f s [%s], gearboxType="%s", P/m=%.1f kW/t\n', ...
-            cfg.RUN_ID, gb.shiftDelay, shiftSrc, gbType, p2w);
-    else
-        fprintf('shiftDelay = %.3f s [%s], gearboxType="%s", P/m=%.1f kW/t\n', ...
-            gb.shiftDelay, shiftSrc, gbType, p2w);
     end
 
     % --- Powertrain Config ---
@@ -368,20 +358,20 @@ for i = start_idx:end_idx
     
     %% Save to .mat for Debug only if not HPC Mode
     if ~DOE_HPC_MODE
-        % Get actual datetime
         actual_datetime = string(datetime("now", "Format", "yyyyMMdd_HHmmss"));
 
         % Create main folder if not yet exist
         save_dir_local = "Export_Debug_local";
+
         if ~exist(save_dir_local, 'dir')
             mkdir(save_dir_local)
         end
 
-        % Create save folder
+        % Create folder
         save_dir = fullfile(save_dir_local, actual_datetime);
         mkdir(save_dir)
 
-        % Save log as .mat file to folder
+        % Save log as .mat file
         filename = "log_" + ...
             actual_datetime + "_" + ...
             "runID" + string(runID) + ... 
@@ -393,15 +383,14 @@ for i = start_idx:end_idx
 
         % Copy slx file to folder
         copyfile(DOE_SL_MODEL_FILE, save_dir);
-        % [~, filename, ext] = fileparts(DOE_SL_MODEL_FILE);
-        % new_filename = filename + "_copy" + ext;
-        % old_filename = [filename, ext];
-        % movefile(fullfile(save_dir, old_filename), fullfile(save_dir, new_filename)); 
+        [~, filename, ext] = fileparts(DOE_SL_MODEL_FILE);
+        new_filename = filename + "_copy" + ext;
+        old_filename = [filename, ext];
+        movefile(fullfile(save_dir, old_filename), fullfile(save_dir, new_filename)); 
 
         % Copy DoE .m to folder
         copyfile("DoE_main.m", save_dir);
         
-        % Save results table to folder
         filename = "results_" + actual_datetime + "_" + ...
             "runID" + string(runID) + ... 
             ".xlsx";
@@ -409,27 +398,7 @@ for i = start_idx:end_idx
         if DOE_ADD_ACTUAL_COMPARISON
             results_table = addActualComparison(results_table, actual_values_filename);
         end
-        writetable(results_table, fullfile(save_dir, filename));
-
-        % .zip erstellen
-        save_dir = string(save_dir);
-        [parentFolder, zipName] = fileparts(save_dir);
-        zipFile = fullfile(parentFolder, zipName + ".zip");
-        % Inhalte des Ordners sammeln, aber "." und ".." ausschließen
-        d = dir(save_dir);
-        names = {d.name};
-        names = names(~ismember(names, {'.', '..'}));
-        % ZIP erstellen: Inhalte relativ zu save_dir packen
-        zip(zipFile, names, save_dir);
-
-        % Delete folder
-        if isfile(zipFile)
-            rmdir(char(save_dir), 's');
-            fprintf('ZIP erstellt und Ordner gelöscht:\n%s\n', zipFile);
-        else
-            warning('ZIP wurde nicht erstellt. Ordner wurde nicht gelöscht.');
-        end
-        
+        writetable(results_table, fullfile(filename);
 
     end
 
