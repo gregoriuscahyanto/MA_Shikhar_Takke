@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Low-I/O dynamic DoE Hybrid HPC helper.
+"""Low-I/O dynamic DoE HPC helper.
 
 Intermediate HPC results are CSV to avoid heavy Excel I/O. The post step writes
-one final Excel workbook for comparison with DoE_ActualValues_Hybrid.xlsx.
+one final Excel workbook and optionally compares against DoE_ActualValues.xlsx.
 """
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ def iter_existing_result_files(results_dir: Path) -> Iterable[Path]:
                 if path.name.startswith("~$") or ".tmp." in path.name:
                     continue
                 yield path
-    final_file = results_dir / "DoE_Hybrid_Results_Comparison.xlsx"
+    final_file = results_dir / "DoE_Results_Comparison.xlsx"
     if final_file.exists():
         yield final_file
 
@@ -246,7 +246,7 @@ def cmd_post(args: argparse.Namespace) -> None:
     actuals_file = Path(args.actuals_file).resolve() if args.actuals_file else None
     results_dir = Path(args.results_dir).resolve()
     chunks_dir = results_dir / "chunks"
-    final_file = results_dir / "DoE_Hybrid_Results_Comparison.xlsx"
+    final_file = results_dir / "DoE_Results_Comparison.xlsx"
 
     if not input_csv.exists():
         raise FileNotFoundError(input_csv)
@@ -297,7 +297,7 @@ def cmd_post(args: argparse.Namespace) -> None:
     with pd.ExcelWriter(tmp_file, engine="openpyxl") as writer:
         combined.to_excel(writer, index=False, sheet_name="Comparison")
         summary = pd.DataFrame([
-            {"Metric": "Rows in DoE_Inp_Hybrid", "Value": len(input_df)},
+            {"Metric": "Rows in DoE_Inp", "Value": len(input_df)},
             {"Metric": "Rows in merged results", "Value": len(combined)},
             {"Metric": "Missing/invalid RUN_ID count", "Value": len(missing_ids)},
             {"Metric": "Invalid/NaN RUN_ID count", "Value": len(invalid_ids)},
@@ -326,20 +326,20 @@ def cmd_post(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Low-I/O dynamic DoE Hybrid HPC helper")
+    parser = argparse.ArgumentParser(description="Low-I/O dynamic DoE HPC helper")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_plan = sub.add_parser("plan")
-    p_plan.add_argument("--input-csv", default=str(ROOT / DEFAULT_DOE_REL / "DoE_Inp_Hybrid.csv"))
-    p_plan.add_argument("--results-dir", default=str(ROOT / DEFAULT_DOE_REL / "DoE_Hybrid_HPC_Results"))
+    p_plan.add_argument("--input-csv", default=str(ROOT / DEFAULT_DOE_REL / "DoE_Inp.csv"))
+    p_plan.add_argument("--results-dir", default=str(ROOT / DEFAULT_DOE_REL / "DoE_HPC_Results"))
     p_plan.add_argument("--plan-dir", default=str(ROOT / "logs" / "doe_current_plan"))
     p_plan.add_argument("--chunk-size", type=int, default=int(os.environ.get("DOE_CHUNK_SIZE", "10")))
     p_plan.set_defaults(func=cmd_plan)
 
     p_post = sub.add_parser("post")
-    p_post.add_argument("--input-csv", default=str(ROOT / DEFAULT_DOE_REL / "DoE_Inp_Hybrid.csv"))
-    p_post.add_argument("--actuals-file", default=str(ROOT / DEFAULT_DOE_REL / "DoE_ActualValues_Hybrid.xlsx"))
-    p_post.add_argument("--results-dir", default=str(ROOT / DEFAULT_DOE_REL / "DoE_Hybrid_HPC_Results"))
+    p_post.add_argument("--input-csv", default=str(ROOT / DEFAULT_DOE_REL / "DoE_Inp.csv"))
+    p_post.add_argument("--actuals-file", default=str(ROOT / DEFAULT_DOE_REL / "DoE_ActualValues.xlsx"))
+    p_post.add_argument("--results-dir", default=str(ROOT / DEFAULT_DOE_REL / "DoE_HPC_Results"))
     p_post.add_argument("--allow-incomplete", action="store_true")
     p_post.set_defaults(func=cmd_post)
 

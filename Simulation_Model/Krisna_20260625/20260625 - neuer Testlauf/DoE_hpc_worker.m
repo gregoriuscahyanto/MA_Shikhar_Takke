@@ -15,7 +15,7 @@ function DoE_hpc_worker(plan_dir, sim_dir, local_results_dir, shared_results_dir
         local_results_dir = fullfile(tempdir, 'doe_worker_results');
     end
     if nargin < 4 || isempty(shared_results_dir)
-        shared_results_dir = fullfile(pwd, 'DoE', 'DoE_Hybrid_HPC_Results', 'chunks');
+        shared_results_dir = fullfile(pwd, 'DoE', 'DoE_HPC_Results', 'chunks');
     end
     if nargin < 5
         actual_values_filename = '';
@@ -179,10 +179,12 @@ function DoE_hpc_worker(plan_dir, sim_dir, local_results_dir, shared_results_dir
     end
 
     try
-        mdl = 'Simulation_Fahrmodell_v3_straight_line';
-        if bdIsLoaded(mdl)
-            try, set_param(mdl, 'FastRestart', 'off'); catch, end
-            close_system(mdl, 0);
+        for mdlCell = {'Simulation_Fahrmodell_v4_straight_line', 'Simulation_Fahrmodell_v3_straight_line'}
+            mdl = mdlCell{1};
+            if bdIsLoaded(mdl)
+                try, set_param(mdl, 'FastRestart', 'off'); catch, end
+                close_system(mdl, 0);
+            end
         end
     catch ME
         fprintf('WARNING during model cleanup: %s\n', ME.message);

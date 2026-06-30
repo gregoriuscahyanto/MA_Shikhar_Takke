@@ -13,3 +13,10 @@ sweep_results_**resume*
 DoE_chunk_*.csv
 
 Export_Debug_local/
+
+_alt/
+legacy_shell_scripts/
+legacy_slurm_scripts/
+
+
+*.asv

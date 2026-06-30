@@ -15,11 +15,9 @@ if ~isempty(script_dir)
     cd(script_dir);
 end
 
-% default_doe         	= 'DoE_Inp_Hybrid_random5.csv';
-% default_actualvalues    = 'DoE_ActualValues_Hybrid.xlsx';
-
-default_doe         	= 'DoE_Inp_ICE_random20.csv';
-default_actualvalues    = 'DoE_ActualValues_ICE.xlsx';
+% Allgemeiner DoE-Input: dieselbe Schema-Datei kann ICE, Hybrid und EV enthalten.
+default_doe             = 'DoE_Inp.csv';
+default_actualvalues    = 'DoE_ActualValues.xlsx';
 
 default_sim             = 'Simulation_Fahrmodell_v4_straight_line';
 
@@ -612,7 +610,7 @@ end
 
 
 function results_table = addActualComparison(results_table, actual_values_filename)
-    % Adds ActualValues and error columns when DoE_ActualValues_Hybrid.xlsx is available.
+    % Adds ActualValues and error columns when DoE_ActualValues.xlsx is available.
     if isempty(results_table) || ~ismember('RUN_ID', results_table.Properties.VariableNames)
         return;
     end
