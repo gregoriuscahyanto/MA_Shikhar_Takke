@@ -1,7 +1,8 @@
 clear; clc;
 
 % doe_file = "DoE_Inp_Hybrid.csv";
-doe_file = "DoE_Inp_ICE.csv";
+% doe_file = "DoE_Inp_ICE.csv";
+doe_file = "DoE_Inp.csv";
 
 nPick = 20;
 
