@@ -19,7 +19,7 @@ function ams_json_to_DoE_Inp(inputFile, outBase)
 %   - Actual 0-100 km/h values are written to a separate sheet/file because
 %     they are validation targets, not simulation inputs.
 
-    fprintf("ams_json_to_DoE_Inp POWERTRAIN_EV_FIX_V7\n");
+    fprintf("ams_json_to_DoE_Inp POWERTRAIN_EV_FIX_V8_CVT_EXCLUDED\n");
 
     if nargin < 1 || strlength(safeStringScalar(inputFile)) == 0
         if isfile("webscraper_auto_motor_sport_marken_modelle.zip")
@@ -258,6 +258,10 @@ function row = convertRawToDoeRow(raw, emptyRow)
         safeStringScalar(raw.ePowerText), safeStringScalar(raw.ePower2Text), safeStringScalar(raw.eMotorCountText), ...
         safeStringScalar(raw.eLocText), safeStringScalar(raw.eLoc2Text), safeStringScalar(raw.gearboxText), ...
         safeStringScalar(raw.variantMeta)], " "));
+    nameVariantTxt = safeLowerString(strjoin([safeStringScalar(raw.vehicleName), safeStringScalar(raw.variantMeta)], " "));
+    has2WDNameHint = contains2WDHint(nameVariantTxt);
+    hasAWDNameHint = containsAny(nameVariantTxt, ["awd", "4wd", "4x4", "allrad"]);
+    hasCVTGearbox = isCvtGearboxText(raw.gearboxText);
 
     combustionFuelHint = containsAny(fuel, ["benzin", "diesel", "super", "normal", "autogas", "erdgas", "wasserstoff"]);
     hasICE = ~contains(fuel, "elektro") && ( ...
@@ -308,6 +312,10 @@ function row = convertRawToDoeRow(raw, emptyRow)
     row.Actual_0_to_100_s = raw.actual0100_s;
     row.Actual_max_speed_kmh = raw.vmax_kmh;
 
+    if hasCVTGearbox
+        warnings(end+1) = "CVT/e-CVT excluded"; %#ok<AGROW>
+    end
+
     % Plausibility gate for known scraper mix-ups:
     % A pure EV with a normal 7/8/9-speed automatic gearbox is very likely
     % not a clean EV row (example: "S 450 ...", fuel="Elektro", gearbox="9-Gang").
@@ -328,6 +336,15 @@ function row = convertRawToDoeRow(raw, emptyRow)
     row.HM_VA = double(contains(drive, "vorderrad") || contains(engineLoc, "vorn") || row.AWD == 1);
     if contains(drive, "hinterrad") && row.AWD == 0
         row.HM_VA = 0;
+    end
+    if has2WDNameHint && ~hasAWDNameHint && row.AWD == 1
+        row.AWD = 0;
+        if contains(drive, "hinterrad") || contains(eLoc, "hinten")
+            row.HM_VA = 0;
+        else
+            row.HM_VA = 1;
+        end
+        warnings(end+1) = "AWD repaired from vehicle-name 2WD/4x2 hint"; %#ok<AGROW>
     end
 
     row.weight_dist = estimateWeightDist(row.AWD, row.HM_VA, drive, engineLoc, body, isEV);
@@ -477,7 +494,11 @@ function row = convertRawToDoeRow(raw, emptyRow)
         % positive power value as total system power, then split by motor count.
         evPwrCandidates = [raw.system_kW, raw.power_kW, ePwr1, raw.ePower2_kW];
         evPwrCandidates = evPwrCandidates(isfinite(evPwrCandidates) & evPwrCandidates > 0);
-        if isempty(evPwrCandidates)
+        if has2WDNameHint && ~hasAWDNameHint && isfinite(raw.power_kW) && raw.power_kW > 0 && ...
+                isfinite(raw.system_kW) && raw.system_kW > 1.35 * raw.power_kW
+            totalPwr = raw.power_kW;
+            warnings(end+1) = "EV 2WD power_kW preferred over doubled system_kW"; %#ok<AGROW>
+        elseif isempty(evPwrCandidates)
             totalPwr = 120;
             warnings(end+1) = "EV power fallback"; %#ok<AGROW>
         else
@@ -494,7 +515,9 @@ function row = convertRawToDoeRow(raw, emptyRow)
         end
 
         nMot = max(1, round(fallback(raw.eMotorCount, 1)));
-        if row.AWD == 1 && nMot < 2
+        if has2WDNameHint && ~hasAWDNameHint
+            nMot = 1;
+        elseif row.AWD == 1 && nMot < 2
             nMot = 2;
         end
         perMotorPwr = totalPwr / nMot;
@@ -650,7 +673,9 @@ function tf = isUsableDoeRow(row)
     hasWheelbase = isfinite(row.Wheelbase) && row.Wheelbase > 1.5;
     hasArea = isfinite(row.A_front) && row.A_front > 1.0;
     isSuspiciousEV = strcmpi(string(row.Powertrain), "EV") && contains(string(row.InputWarnings), "suspicious EV");
-    tf = hasMass && hasPower && hasWheelbase && hasArea && ~isSuspiciousEV;
+    isCvtExcluded = contains(string(row.InputWarnings), "CVT/e-CVT excluded") || ...
+        (isfield(row, 'Transmission_Type') && strcmpi(string(row.Transmission_Type), "cvt_excluded"));
+    tf = hasMass && hasPower && hasWheelbase && hasArea && ~isSuspiciousEV && ~isCvtExcluded;
 end
 
 %% ------------------------- DoE schema -------------------------
@@ -1352,6 +1377,10 @@ end
 function nG = estimateGearCount(gearboxText, powertrain)
     txt = safeLowerString(gearboxText);
     nG = parseFirstNumber(txt);
+    if isCvtGearboxText(txt)
+        nG = NaN;
+        return;
+    end
     if string(powertrain) == "EV"
         nG = 1;
         return;
@@ -1396,6 +1425,10 @@ end
 
 function delay = estimateShiftDelay(gearboxText, powertrain, pwr_kW, mass_kg)
     txt = safeLowerString(gearboxText);
+    if isCvtGearboxText(txt)
+        delay = NaN;
+        return;
+    end
     if string(powertrain) == "EV"
         delay = 0.05;
         return;
@@ -1427,7 +1460,9 @@ end
 
 function type = resolveTransmissionType(gearboxText, powertrain)
     txt = safeLowerString(gearboxText);
-    if string(powertrain) == "EV"
+    if isCvtGearboxText(txt)
+        type = "cvt_excluded";
+    elseif string(powertrain) == "EV"
         type = "single_speed_ev";
     elseif containsAny(txt, ["doppelkuppl", "dsg", "pdk", "s tronic", "m dct"])
         type = "dct";
@@ -1496,6 +1531,17 @@ function s = formatNumVector(v)
         parts(i) = string(sprintf('%.5g', v(i)));
     end
     s = "[" + strjoin(parts, ", ") + "]";
+end
+
+function tf = isCvtGearboxText(txt)
+    txt = safeLowerString(txt);
+    tf = containsAny(txt, ["cvt", "e-cvt", "ecvt", "stufenlos", "stufenloses", ...
+        "continuously variable", "continuous variable", "variator", "multitronic", "xtronic"]);
+end
+
+function tf = contains2WDHint(txt)
+    txt = safeLowerString(txt);
+    tf = containsAny(txt, ["2wd", "2 wd", "4x2", "4 x 2", "two wheel drive"]);
 end
 
 function tf = containsAny(txt, patterns)

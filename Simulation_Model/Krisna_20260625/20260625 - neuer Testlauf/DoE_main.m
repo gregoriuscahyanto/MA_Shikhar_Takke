@@ -501,10 +501,20 @@ for i = start_idx:end_idx
     if ~isfinite(vmaxLimit) || vmaxLimit <= 0
         vmaxLimit = NaN;
     end
+    current_result.Vmax_limit_used_kmh = vmaxLimit;
+    current_result.Vmax_limiter_enabled = isfinite(vmaxLimit);
+    if isfinite(vmaxLimit)
+        vmaxDriverTarget = vmaxLimit;
+    else
+        vmaxDriverTarget = 350;
+    end
     try
         assignin('base', 'Actual_max_speed_kmh', vmaxLimit);
         assignin('base', 'vmax_limit_kmh', vmaxLimit);
+        assignin('base', 'vmax_driver_target_kmh', vmaxDriverTarget);
         assignin('base', 'SL_target_vmax_kmh', vmaxLimit);
+        assignin('base', 'vmax_limiter_enable', double(isfinite(vmaxLimit)));
+        assignin('base', 'vmax_limiter_band_kmh', 2.0);
     catch
     end
 
@@ -536,7 +546,8 @@ for i = start_idx:end_idx
     % Extract SL. Missing variables are written as NaN, so this stays
     % compatible with the current SLX and with future diagnostic outputs.
     vars_SL = {'time_0_to_100', 'time_0_to_200', 'time_80_to_120', 'time_60_to_120', ...
-               'max_speed', 'max_launch_acc', 'v_final_kmh', 'v_max_kmh', ...
+               'max_speed', 'max_speed_physical', 'max_speed_limited', ...
+               'max_launch_acc', 'v_final_kmh', 'v_max_kmh', ...
                'stop_reason', 'Reached_100', 'Reached_200', 'Reached_80_120', 'Reached_60_120'};
     current_result = extractVars(simOut_SL, vars_SL, current_result, 'SL_');
     current_result = sanitizeStraightLineKpis(current_result);
@@ -832,7 +843,7 @@ function results_table = addActualComparison(results_table, actual_values_filena
     % Some model variants create SL_v_max_kmh as an empty/NaN placeholder while
     % the usable result is stored in SL_max_speed or SL_max_speed_physical.
     maxCol = pickFirstFiniteColumnMain(results_table, ...
-        {'SL_max_speed_physical', 'SL_max_speed', 'SL_v_max_kmh', 'max_speed'});
+        {'SL_max_speed_limited', 'SL_max_speed_physical', 'SL_max_speed', 'SL_v_max_kmh', 'max_speed'});
     if ~isempty(maxCol) && ismember('Actual_max_speed_kmh', results_table.Properties.VariableNames)
         simV = str2double(string(results_table.(maxCol)));
         actualV = str2double(string(results_table.Actual_max_speed_kmh));
@@ -920,6 +931,19 @@ function [cfg, warnings, errors] = validateAndRepairInput(cfg, runID)
     isHybrid = pt == "HYBRID" || pt == "PHEV" || pt == "HEV";
 
     rawGearboxTxt = lower(string(getTextField(cfg, 'Raw_Gearbox')));
+    gearboxAllTxt = lower(string(getTextField(cfg, 'Raw_Gearbox')) + " " + string(getTextField(cfg, 'Transmission_Type')));
+    vehicleNameTxt = lower(string(getTextField(cfg, 'Vehicle_Name')));
+    has2WDNameHint = contains2WDHintMain(vehicleNameTxt);
+    hasAWDNameHint = containsAnyMain(vehicleNameTxt, ["awd", "4wd", "4x4", "allrad"]);
+
+    if isCvtGearboxTextMain(gearboxAllTxt)
+        errors(end+1) = "CVT/e-CVT excluded from this simulation"; %#ok<AGROW>
+    end
+    if has2WDNameHint && ~hasAWDNameHint && cfg.AWD == 1
+        cfg.AWD = 0;
+        cfg.HM_VA = 1;
+        warnings(end+1) = "AWD repaired from vehicle-name 2WD/4x2 hint"; %#ok<AGROW>
+    end
     if isEV && containsAnyMain(rawGearboxTxt, ["3-gang", "4-gang", "5-gang", "6-gang", "7-gang", "8-gang", "9-gang", "10-gang"])
         errors(end+1) = "Suspicious EV input: multi-speed ICE gearbox text in Raw_Gearbox"; %#ok<AGROW>
     end
@@ -942,6 +966,17 @@ function [cfg, warnings, errors] = validateAndRepairInput(cfg, runID)
         oldTq  = max([cfg.tq_EV_max, cfg.tq_P2_max, cfg.tq_P3_max, cfg.tq_P4_max, cfg.tq_ICE_max]);
         oldN   = max([cfg.n_EV_max, cfg.n_P2_max, cfg.n_P3_max, cfg.n_P4_max, 16000]);
         cfg.Pwr_ICE_max_kW = 0; cfg.tq_ICE_max = 0; cfg.tq_ICE_idle = 0; cfg.n_ICE_idle = 0; cfg.n_ICE_max = 0;
+        if has2WDNameHint && ~hasAWDNameHint
+            cfg.AWD = 0;
+            cfg.E0 = 1; cfg.E1 = 0; cfg.E2 = 0; cfg.E3 = 0; cfg.E4 = 0;
+            cfg.Pwr_P4_max_kW = 0; cfg.tq_P4_max = 0; cfg.n_P4_max = 0;
+            rawPowerFromText_kW = parseFirstNumberMain(getTextField(cfg, 'Raw_Power'));
+            if isfinite(rawPowerFromText_kW) && rawPowerFromText_kW > 0 && cfg.Pwr_EV_max_kW > 1.35 * rawPowerFromText_kW
+                cfg.Pwr_EV_max_kW = rawPowerFromText_kW;
+                warnings(end+1) = "EV 2WD power capped from Raw_Power"; %#ok<AGROW>
+            end
+            warnings(end+1) = "EV topology forced to single primary motor from 2WD/4x2 hint"; %#ok<AGROW>
+        end
         if ~(cfg.E0 || cfg.E1 || cfg.E2 || cfg.E3 || cfg.E4)
             if cfg.AWD == 1
                 cfg.E2 = 1;
@@ -1110,7 +1145,8 @@ function current_result = makeSkippedResult(cfg, runID, inputWarnings, inputErro
     current_result.InputErrors = string(strjoin(inputErrors, ' | '));
     current_result.SimStatus = "SKIPPED_INPUT_ERROR";
     fields = {'SL_time_0_to_100','SL_time_0_to_200','SL_time_80_to_120','SL_time_60_to_120', ...
-              'SL_max_speed','SL_max_launch_acc','SL_v_final_kmh','SL_v_max_kmh'};
+              'SL_max_speed','SL_max_speed_physical','SL_max_speed_limited', ...
+              'SL_max_launch_acc','SL_v_final_kmh','SL_v_max_kmh'};
     for k = 1:numel(fields)
         current_result.(fields{k}) = NaN;
     end
@@ -1138,12 +1174,22 @@ function current_result = sanitizeStraightLineKpis(current_result)
             current_result.(rName) = false;
         end
     end
-    if isfield(current_result, 'SL_v_max_kmh') && isfinite(double(current_result.SL_v_max_kmh))
+    if isfield(current_result, 'SL_max_speed_physical') && isfinite(double(current_result.SL_max_speed_physical))
+        % Keep explicit physical Vmax from Simulink.
+    elseif isfield(current_result, 'SL_v_max_kmh') && isfinite(double(current_result.SL_v_max_kmh))
         current_result.SL_max_speed_physical = current_result.SL_v_max_kmh;
-    elseif isfield(current_result, 'SL_max_speed')
+    elseif isfield(current_result, 'SL_max_speed') && isfinite(double(current_result.SL_max_speed))
         current_result.SL_max_speed_physical = current_result.SL_max_speed;
     else
         current_result.SL_max_speed_physical = NaN;
+    end
+
+    if isfield(current_result, 'SL_max_speed_limited') && isfinite(double(current_result.SL_max_speed_limited))
+        % Keep explicit limited Vmax from Simulink.
+    else
+        % Do not synthesize a limited Vmax here; otherwise Vmax validation would
+        % be hidden even when the SLX limiter has not actually been implemented.
+        current_result.SL_max_speed_limited = NaN;
     end
 end
 
@@ -1160,6 +1206,9 @@ function [delay, source, gbType, p2w] = resolveShiftDelay(cfg)
         p2w = NaN;
     end
 
+    if isCvtGearboxTextMain(gbText)
+        delay = NaN; source = "cvt_excluded"; gbType = "cvt_excluded"; return;
+    end
     if pt == "EV"
         delay = 0.05; source = "ev_single_speed"; gbType = "single_speed_ev"; return;
     end
@@ -1380,6 +1429,10 @@ end
 
 function nG = estimateGearCountMain(cfg)
     txt = lower(string(getTextField(cfg, 'Raw_Gearbox')));
+    if isCvtGearboxTextMain(txt)
+        nG = NaN;
+        return;
+    end
     nG = getNumericField(cfg, 'No_Gears', NaN);
     if isfinite(nG) && nG > 1, nG = round(nG); return; end
     if containsAnyMain(txt, ["doppelkuppl", "dsg", "pdk", "s tronic", "m dct"])
@@ -1420,6 +1473,27 @@ function s = formatVectorMain(v)
         parts(k) = string(sprintf('%.5g', v(k)));
     end
     s = "[" + strjoin(parts, ", ") + "]";
+end
+
+function tf = isCvtGearboxTextMain(txt)
+    txt = lower(string(txt));
+    tf = containsAnyMain(txt, ["cvt", "e-cvt", "ecvt", "stufenlos", "stufenloses", ...
+        "continuously variable", "continuous variable", "variator", "multitronic", "xtronic"]);
+end
+
+function tf = contains2WDHintMain(txt)
+    txt = lower(string(txt));
+    tf = containsAnyMain(txt, ["2wd", "2 wd", "4x2", "4 x 2", "two wheel drive"]);
+end
+
+function x = parseFirstNumberMain(s)
+    s = char(string(s));
+    tok = regexp(s, '[-+]?\d+(?:[.,]\d+)?', 'match', 'once');
+    if isempty(tok)
+        x = NaN;
+    else
+        x = str2double(strrep(tok, ',', '.'));
+    end
 end
 
 function tf = containsAnyMain(txt, patterns)
