@@ -64,6 +64,9 @@ function ams_json_to_DoE_Inp(inputFile, outBase)
     nSkipped = 0;
 
     for iItem = 1:nItems
+
+        fprintf("Item %d from %d\n", iItem, nItems);
+
         item = items(iItem);
         cols = getVariantColumns(item);
         if isempty(cols)
@@ -534,6 +537,29 @@ function row = convertRawToDoeRow(raw, emptyRow)
         row.Pwr_EV_max_kW = 0; row.tq_EV_max = 0; row.n_EV_max = 0; row.Pwr_EV_nmax_red_perc = 0;
     end
 
+    % Treat weak 48V/P0-only mild hybrids as ICE for the straight-line model.
+    % The model does not represent P0 as a real axle traction machine; keeping
+    % these rows as full Hybrid made ICE-like vehicles too optimistic.
+    eTractionPower_kW = fallback(row.Pwr_P2_max_kW, 0) + fallback(row.Pwr_P3_max_kW, 0) + fallback(row.Pwr_P4_max_kW, 0);
+    eAllPowerNoEV_kW = fallback(row.Pwr_P0_max_kW, 0) + eTractionPower_kW;
+    mildOnlyP0 = isHybrid && row.P0 == 1 && row.P2 == 0 && row.P3 == 0 && row.P4 == 0 && row.P4_DM == 0 && ...
+        eAllPowerNoEV_kW > 0 && eAllPowerNoEV_kW <= 25 && ...
+        (containsAny(allTxt, ["mhev", "mild", "48v", "48 v", "mild-hybrid", "mildhybrid"]) || ...
+         (isfinite(voltage) && voltage <= 80));
+    if mildOnlyP0
+        row.Powertrain = "ICE";
+        row.VM = 1; row.EV = 0; row.Hy = 0;
+        row.P0 = 0; row.P2 = 0; row.P3 = 0; row.P4 = 0; row.P4_DM = 0;
+        row.E0 = 0; row.E1 = 0; row.E2 = 0; row.E3 = 0; row.E4 = 0;
+        row.tq_P0_max = 0; row.Pwr_P0_max_kW = 0; row.n_P0_max = 0;
+        row.tq_P2_max = 0; row.Pwr_P2_max_kW = 0; row.n_P2_max = 0;
+        row.tq_P3_max = 0; row.Pwr_P3_max_kW = 0; row.n_P3_max = 0;
+        row.tq_P4_max = 0; row.Pwr_P4_max_kW = 0; row.n_P4_max = 0;
+        row.tq_EV_max = 0; row.Pwr_EV_max_kW = 0; row.n_EV_max = 0; row.Pwr_EV_nmax_red_perc = 0;
+        isHybrid = false;
+        warnings(end+1) = "P0-only mild hybrid treated as ICE"; %#ok<AGROW>
+    end
+
     % Replace invalid E-machine values by zero.
     emFields = {"tq_P0_max","Pwr_P0_max_kW","n_P0_max","tq_P2_max","Pwr_P2_max_kW","n_P2_max", ...
                 "tq_P3_max","Pwr_P3_max_kW","n_P3_max","tq_P4_max","Pwr_P4_max_kW","n_P4_max", ...
@@ -592,6 +618,13 @@ function row = convertRawToDoeRow(raw, emptyRow)
     else
         row.n_s = 1;
         row.n_p = 1;
+    end
+
+    if isEV || isHybrid
+        [row, battWarn] = repairBatteryDischargePowerConverter(row);
+        if strlength(battWarn) > 0
+            warnings(end+1) = battWarn; %#ok<AGROW>
+        end
     end
 
     row.facSocInit = 0.95;
@@ -1129,6 +1162,74 @@ function [L, W, H] = parseDimensions(s)
         L = str2double(strrep(tok{1}, ',', '.')) / 1000;
         W = str2double(strrep(tok{2}, ',', '.')) / 1000;
         H = str2double(strrep(tok{3}, ',', '.')) / 1000;
+    end
+end
+
+function P_kW = totalElectricPropulsionPowerConverter(row)
+    P_kW = 0;
+    if ~isstruct(row)
+        return;
+    end
+    if isfield(row, 'EV') && row.EV == 1 && row.Hy == 0
+        primaryMotors = double(row.E0 == 1 || row.E1 == 1 || row.E2 == 1 || row.E3 == 1 || row.E4 == 1);
+        secondaryMotors = 0;
+        if row.E2 == 1
+            secondaryMotors = 1;
+        elseif row.E3 == 1
+            secondaryMotors = 2;
+        elseif row.E4 == 1
+            secondaryMotors = 3;
+        end
+        pEV = max(fallback(row.Pwr_EV_max_kW, 0), 0);
+        pP4 = max(fallback(row.Pwr_P4_max_kW, 0), 0);
+        if pP4 <= 0
+            pP4 = pEV;
+        end
+        P_kW = primaryMotors * pEV + secondaryMotors * pP4;
+    else
+        P_kW = max(fallback(row.Pwr_P0_max_kW, 0), 0) + ...
+               max(fallback(row.Pwr_P2_max_kW, 0), 0) + ...
+               max(fallback(row.Pwr_P3_max_kW, 0), 0) + ...
+               max(fallback(row.Pwr_P4_max_kW, 0), 0);
+        if isfield(row, 'P4_DM') && row.P4_DM == 1
+            P_kW = P_kW + max(fallback(row.Pwr_P4_max_kW, 0), 0);
+        end
+    end
+end
+
+function [row, warningText] = repairBatteryDischargePowerConverter(row)
+    warningText = "";
+    P_req_kW = totalElectricPropulsionPowerConverter(row);
+    if ~isfinite(P_req_kW) || P_req_kW <= 0
+        return;
+    end
+
+    Vcell = fallback(row.Cell_V_nom, 3.7);
+    if ~isfinite(Vcell) || Vcell <= 0
+        Vcell = 3.7;
+        row.Cell_V_nom = Vcell;
+    end
+    row.n_s = max(1, round(fallback(row.n_s, 1)));
+    row.n_p = max(1, round(fallback(row.n_p, 1)));
+
+    V_pack_nom = row.n_s * Vcell;
+    P_target_kW = 1.10 * P_req_kW;
+    I_req_A = P_target_kW * 1000 / (V_pack_nom * row.n_p);
+    I_old_A = fallback(row.Cell_I_max_dis, 15);
+
+    if isfinite(I_req_A) && I_req_A > I_old_A
+        I_cap_A = 60;
+        if I_req_A <= I_cap_A
+            row.Cell_I_max_dis = I_req_A;
+        else
+            row.Cell_I_max_dis = I_cap_A;
+            np_req = ceil(P_target_kW * 1000 / (V_pack_nom * row.Cell_I_max_dis));
+            if isfinite(np_req) && np_req > row.n_p
+                row.n_p = np_req;
+            end
+        end
+        warningText = sprintf("battery discharge capability raised for electric power plausibility: P_req=%.1f kW, Icell %.1f->%.1f A, n_p=%d", ...
+            P_req_kW, I_old_A, row.Cell_I_max_dis, row.n_p);
     end
 end
 

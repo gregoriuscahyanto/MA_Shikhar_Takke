@@ -489,6 +489,11 @@ for i = start_idx:end_idx
     current_result.Power_to_weight_kW_per_t = p2w;
     current_result.GearCount_used = gb.No_Gears;
     current_result.GearRatio_used = string(mat2str(gb.Gear_Ratio));
+    current_result.ElectricPower_req_kW_est = totalElectricPropulsionPowerMain(cfg);
+    current_result.Battery_PackPower_dis_kW_est = estimatePackDischargePowerMain(cfg);
+    current_result.Battery_Cell_I_max_dis_A_used = cfg.Cell_I_max_dis;
+    current_result.Battery_n_s_used = cfg.n_s;
+    current_result.Battery_n_p_used = cfg.n_p;
     current_result.SimStatus = "SETUP_OK";
 
     % Make actual Vmax/targets visible to optional Simulink stop/KPI blocks.
@@ -823,17 +828,20 @@ function results_table = addActualComparison(results_table, actual_values_filena
         results_table.Error_0_to_100_pct = 100 .* results_table.Error_0_to_100_s ./ actualVals;
     end
 
-    maxCol = '';
-    if ismember('SL_v_max_kmh', results_table.Properties.VariableNames)
-        maxCol = 'SL_v_max_kmh';
-    elseif ismember('SL_max_speed', results_table.Properties.VariableNames)
-        maxCol = 'SL_max_speed';
-    end
+    % Prefer the first simulated Vmax column that actually contains finite values.
+    % Some model variants create SL_v_max_kmh as an empty/NaN placeholder while
+    % the usable result is stored in SL_max_speed or SL_max_speed_physical.
+    maxCol = pickFirstFiniteColumnMain(results_table, ...
+        {'SL_max_speed_physical', 'SL_max_speed', 'SL_v_max_kmh', 'max_speed'});
     if ~isempty(maxCol) && ismember('Actual_max_speed_kmh', results_table.Properties.VariableNames)
         simV = str2double(string(results_table.(maxCol)));
         actualV = str2double(string(results_table.Actual_max_speed_kmh));
-        results_table.Error_max_speed_kmh = simV - actualV;
-        results_table.Error_max_speed_pct = 100 .* results_table.Error_max_speed_kmh ./ actualV;
+        valid = isfinite(simV) & isfinite(actualV) & actualV > 0;
+        results_table.Error_max_speed_kmh = NaN(height(results_table), 1);
+        results_table.Error_max_speed_pct = NaN(height(results_table), 1);
+        results_table.Error_max_speed_kmh(valid) = simV(valid) - actualV(valid);
+        results_table.Error_max_speed_pct(valid) = 100 .* results_table.Error_max_speed_kmh(valid) ./ actualV(valid);
+        results_table.SL_max_speed_compare_source = repmat(string(maxCol), height(results_table), 1);
     end
 end
 
@@ -999,6 +1007,39 @@ function [cfg, warnings, errors] = validateAndRepairInput(cfg, runID)
         warnings(end+1) = "P4/P4_DM conflict repaired; kept P4_DM"; %#ok<AGROW>
     end
 
+    % 48V/MHEV/P0-only entries should not be treated like full traction hybrids.
+    % In this straight-line model P0 is not a real axle traction machine. Keeping
+    % weak P0-only mild hybrids in the Hybrid topology makes some ICE-like cars
+    % too optimistic and consumes battery logic that is not meaningful here.
+    eTractionPower_kW = max([cfg.Pwr_P2_max_kW, 0]) + max([cfg.Pwr_P3_max_kW, 0]) + max([cfg.Pwr_P4_max_kW, 0]);
+    eAllPowerNoEV_kW = max([cfg.Pwr_P0_max_kW, 0]) + eTractionPower_kW;
+    rawAllTxt = lower(string(getTextField(cfg, 'Raw_Fuel')) + " " + ...
+                      string(getTextField(cfg, 'Raw_Gearbox')) + " " + ...
+                      string(getTextField(cfg, 'Vehicle_Name')) + " " + ...
+                      string(getTextField(cfg, 'Raw_Power')));
+    hasMildHint = containsAnyMain(rawAllTxt, ["mhev", "mild", "48v", "48 v", "mild-hybrid", "mildhybrid"]);
+    lowVoltagePack = isfinite(cfg.n_s) && cfg.n_s > 0 && cfg.n_s <= 25;
+    if cfg.Hy == 1 && cfg.P0 == 1 && cfg.P2 == 0 && cfg.P3 == 0 && cfg.P4 == 0 && cfg.P4_DM == 0 && ...
+            eAllPowerNoEV_kW > 0 && eAllPowerNoEV_kW <= 25 && (hasMildHint || lowVoltagePack)
+        cfg.Powertrain = "ICE";
+        cfg.VM = 1; cfg.EV = 0; cfg.Hy = 0;
+        cfg.P0 = 0; cfg.P2 = 0; cfg.P3 = 0; cfg.P4 = 0; cfg.P4_DM = 0;
+        cfg.tq_P0_max = 0; cfg.Pwr_P0_max_kW = 0; cfg.n_P0_max = 0;
+        cfg.tq_P2_max = 0; cfg.Pwr_P2_max_kW = 0; cfg.n_P2_max = 0;
+        cfg.tq_P3_max = 0; cfg.Pwr_P3_max_kW = 0; cfg.n_P3_max = 0;
+        cfg.tq_P4_max = 0; cfg.Pwr_P4_max_kW = 0; cfg.n_P4_max = 0;
+        cfg.tq_EV_max = 0; cfg.Pwr_EV_max_kW = 0; cfg.n_EV_max = 0;
+        warnings(end+1) = "P0-only mild hybrid treated as ICE"; %#ok<AGROW>
+    end
+
+    % Make the battery discharge current consistent with the requested electric
+    % propulsion power. AMS/DoE fallbacks often produced e.g. 96S/46P but only
+    % 15 A per cell, which limits a high-power EV/hybrid far below its motor map.
+    [cfg, battWarn] = repairBatteryDischargePowerMain(cfg);
+    if strlength(battWarn) > 0
+        warnings(end+1) = battWarn; %#ok<AGROW>
+    end
+
     gr = parseNumericVector(cfg.Gear_Ratio);
     if cfg.EV == 1 && cfg.Hy == 0 && cfg.VM == 0
         cfg.Gear_Ratio = "[1]";
@@ -1144,6 +1185,126 @@ function [delay, source, gbType, p2w] = resolveShiftDelay(cfg)
         else
             delay = 0.10; source = "power_to_weight_fallback";
         end
+    end
+end
+
+function col = pickFirstFiniteColumnMain(T, candidates)
+    col = '';
+    if isempty(T) || ~istable(T)
+        return;
+    end
+    for k = 1:numel(candidates)
+        c = candidates{k};
+        if ismember(c, T.Properties.VariableNames)
+            vals = str2double(string(T.(c)));
+            if any(isfinite(vals))
+                col = c;
+                return;
+            end
+        end
+    end
+end
+
+function P_kW = totalElectricPropulsionPowerMain(cfg)
+    % Estimated total electric propulsion power required from the HV/LV battery.
+    % For EV E2/E3/E4 topologies Pwr_EV_max_kW is the primary motor and
+    % Pwr_P4_max_kW represents each secondary motor branch.
+    P_kW = 0;
+    if ~isstruct(cfg)
+        return;
+    end
+
+    if getNumericField(cfg, 'EV', 0) == 1 && getNumericField(cfg, 'Hy', 0) == 0
+        e0 = getNumericField(cfg, 'E0', 0);
+        e1 = getNumericField(cfg, 'E1', 0);
+        e2 = getNumericField(cfg, 'E2', 0);
+        e3 = getNumericField(cfg, 'E3', 0);
+        e4 = getNumericField(cfg, 'E4', 0);
+
+        primaryMotors = double(e0 == 1 || e1 == 1 || e2 == 1 || e3 == 1 || e4 == 1);
+        secondaryMotors = 0;
+        if e2 == 1
+            secondaryMotors = 1;
+        elseif e3 == 1
+            secondaryMotors = 2;
+        elseif e4 == 1
+            secondaryMotors = 3;
+        end
+
+        pEV = max(getNumericField(cfg, 'Pwr_EV_max_kW', 0), 0);
+        pP4 = max(getNumericField(cfg, 'Pwr_P4_max_kW', 0), 0);
+        if pP4 <= 0
+            pP4 = pEV;
+        end
+        P_kW = primaryMotors * pEV + secondaryMotors * pP4;
+    else
+        P_kW = max(getNumericField(cfg, 'Pwr_P0_max_kW', 0), 0) + ...
+               max(getNumericField(cfg, 'Pwr_P2_max_kW', 0), 0) + ...
+               max(getNumericField(cfg, 'Pwr_P3_max_kW', 0), 0) + ...
+               max(getNumericField(cfg, 'Pwr_P4_max_kW', 0), 0);
+        if getNumericField(cfg, 'P4_DM', 0) == 1
+            % P4_DM contains two secondary machines in the model. If the CSV
+            % only contains one P4 power value, approximate the second branch.
+            P_kW = P_kW + max(getNumericField(cfg, 'Pwr_P4_max_kW', 0), 0);
+        end
+    end
+end
+
+function Ppack_kW = estimatePackDischargePowerMain(cfg)
+    Vnom = getNumericField(cfg, 'Cell_V_nom', NaN);
+    Imax = getNumericField(cfg, 'Cell_I_max_dis', NaN);
+    ns = getNumericField(cfg, 'n_s', NaN);
+    np = getNumericField(cfg, 'n_p', NaN);
+    if isfinite(Vnom) && Vnom > 0 && isfinite(Imax) && Imax > 0 && ...
+            isfinite(ns) && ns > 0 && isfinite(np) && np > 0
+        Ppack_kW = ns * Vnom * np * Imax / 1000;
+    else
+        Ppack_kW = NaN;
+    end
+end
+
+function [cfg, warningText] = repairBatteryDischargePowerMain(cfg)
+    warningText = "";
+    if ~(getNumericField(cfg, 'EV', 0) == 1 || getNumericField(cfg, 'Hy', 0) == 1)
+        return;
+    end
+
+    P_req_kW = totalElectricPropulsionPowerMain(cfg);
+    if ~isfinite(P_req_kW) || P_req_kW <= 0
+        return;
+    end
+
+    Vcell = getNumericField(cfg, 'Cell_V_nom', 3.7);
+    ns = max(1, round(getNumericField(cfg, 'n_s', 1)));
+    np = max(1, round(getNumericField(cfg, 'n_p', 1)));
+    if ~isfinite(Vcell) || Vcell <= 0
+        Vcell = 3.7;
+        cfg.Cell_V_nom = Vcell;
+    end
+    cfg.n_s = ns;
+    cfg.n_p = np;
+
+    V_pack_nom = ns * Vcell;
+    P_target_kW = 1.10 * P_req_kW;  % 10% reserve for losses / voltage sag
+    I_req_A = P_target_kW * 1000 / (V_pack_nom * np);
+    I_old_A = getNumericField(cfg, 'Cell_I_max_dis', 15);
+
+    if isfinite(I_req_A) && I_req_A > I_old_A
+        % Keep the cell current in a plausible generic high-power range. If a
+        % row would need more than this, increase n_p instead of creating an
+        % unrealistic cell current.
+        I_cap_A = 60;
+        if I_req_A <= I_cap_A
+            cfg.Cell_I_max_dis = I_req_A;
+        else
+            cfg.Cell_I_max_dis = I_cap_A;
+            np_req = ceil(P_target_kW * 1000 / (V_pack_nom * cfg.Cell_I_max_dis));
+            if isfinite(np_req) && np_req > np
+                cfg.n_p = np_req;
+            end
+        end
+        warningText = sprintf("battery discharge capability raised for electric power plausibility: P_req=%.1f kW, Icell %.1f->%.1f A, n_p=%d", ...
+            P_req_kW, I_old_A, cfg.Cell_I_max_dis, cfg.n_p);
     end
 end
 
