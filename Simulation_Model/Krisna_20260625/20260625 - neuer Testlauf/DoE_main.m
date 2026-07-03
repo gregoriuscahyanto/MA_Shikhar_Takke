@@ -16,9 +16,11 @@ if ~isempty(script_dir)
 end
 
 % Allgemeiner DoE-Input: dieselbe Schema-Datei kann ICE, Hybrid und EV enthalten.
-default_doe             = 'DoE_Inp.csv';
-default_actualvalues    = 'DoE_ActualValues.xlsx';
+% Prefer the full generated input. Fall back to a random test subset when used
+% inside an exported debug folder.
 
+default_doe             = 'DoE_Inp_random15.csv';
+default_actualvalues    = 'DoE_Inp_ActualValues.xlsx';
 default_sim             = 'Simulation_Fahrmodell_v4_straight_line';
 
 % Get default chunk from table height
@@ -106,6 +108,16 @@ try
         load_system(DOE_SL_MODEL_FILE);
         fprintf('Loaded Simulink model once: %s\n', DOE_SL_MODEL_SIM_NAME);
     end
+    % The ICE multi-speed branch contains 1-D lookup blocks for
+    % Gear -> i_GET. In the original model their breakpoint vector is
+    % [1:1:gb.No_Gears]. For valid one-speed DoE rows this evaluates to
+    % a single breakpoint, which Simulink rejects during compilation.
+    % Use dedicated lookup variables instead. DoE_main guarantees below
+    % that gb_Gears_LUT and gb_Gear_Ratio_LUT contain at least two lookup
+    % points. gb.No_Gears remains the physical gear count and is still
+    % used by the shift manager.
+    patchGearRatioLookupBreakpoints(DOE_SL_MODEL_SIM_NAME);
+
     if DOE_USE_FAST_RESTART
         try
             set_param(DOE_SL_MODEL_SIM_NAME, 'FastRestart', 'on');
@@ -186,7 +198,90 @@ end
 % --- 4. MAIN SIMULATION LOOP ---
 for i = start_idx:end_idx
     
-    cfg = all_configs(i); 
+    cfg = all_configs(i);
+    runID_value = NaN;
+    if isfield(cfg, 'RUN_ID') && ~isempty(cfg.RUN_ID)
+        runID_value = str2double(string(cfg.RUN_ID));
+    end
+    if isfinite(runID_value)
+        runID = runID_value;
+    else
+        runID = i;
+    end
+
+    [cfg, inputWarnings, inputErrors] = validateAndRepairInput(cfg, runID);
+    if ~isempty(inputErrors)
+        fprintf('--- Skipping Row %d (RunID: %d) because of input error(s): %s ---\n', ...
+            i, runID, char(strjoin(inputErrors, ' | ')));
+        current_result = makeSkippedResult(cfg, runID, inputWarnings, inputErrors);
+        if isempty(results_struct)
+            results_struct = current_result;
+        else
+            results_struct = appendStruct(results_struct, current_result);
+        end
+        continue;
+    end
+
+    % --- Robust topology cleanup for AMS/legacy CSV inputs ---
+    % Hybrid and EV are mutually exclusive with VM in VehicleConfig/PowertrainConfig.
+    if isfield(cfg, 'EV') && cfg.EV == 1
+        cfg.VM = 0;
+        cfg.Hy = 0;
+        % Pure EV must use E0-E4, not hybrid P-position flags.
+        if ~isfield(cfg, 'E0'), cfg.E0 = 0; end
+        if ~isfield(cfg, 'E1'), cfg.E1 = 0; end
+        if ~isfield(cfg, 'E2'), cfg.E2 = 0; end
+        if ~isfield(cfg, 'E3'), cfg.E3 = 0; end
+        if ~isfield(cfg, 'E4'), cfg.E4 = 0; end
+        if ~(cfg.E0 || cfg.E1 || cfg.E2 || cfg.E3 || cfg.E4)
+            if isfield(cfg, 'AWD') && cfg.AWD == 1
+                cfg.E2 = 1;
+            else
+                cfg.E0 = 1;
+            end
+        end
+
+        % Legacy EV CSV fallback: older converter versions stored EV power in P2/P4.
+        oldPwr = 0; oldTq = 0; oldN = 16000;
+        if isfield(cfg, 'Pwr_EV_max_kW') && cfg.Pwr_EV_max_kW > 0, oldPwr = cfg.Pwr_EV_max_kW; end
+        if isfield(cfg, 'Pwr_P2_max_kW') && cfg.Pwr_P2_max_kW > oldPwr, oldPwr = cfg.Pwr_P2_max_kW; end
+        if isfield(cfg, 'Pwr_P4_max_kW') && cfg.Pwr_P4_max_kW > oldPwr, oldPwr = cfg.Pwr_P4_max_kW; end
+        if isfield(cfg, 'tq_EV_max') && cfg.tq_EV_max > 0, oldTq = cfg.tq_EV_max; end
+        if isfield(cfg, 'tq_P2_max') && cfg.tq_P2_max > oldTq, oldTq = cfg.tq_P2_max; end
+        if isfield(cfg, 'tq_P4_max') && cfg.tq_P4_max > oldTq, oldTq = cfg.tq_P4_max; end
+        if isfield(cfg, 'n_EV_max') && cfg.n_EV_max > 0, oldN = cfg.n_EV_max;
+        elseif isfield(cfg, 'n_P2_max') && cfg.n_P2_max > 0, oldN = cfg.n_P2_max;
+        elseif isfield(cfg, 'n_P4_max') && cfg.n_P4_max > 0, oldN = cfg.n_P4_max; end
+
+        nMot = 1; hasSecondary = false;
+        if cfg.E1 == 1, nMot = 2; end
+        if cfg.E2 == 1, nMot = 2; hasSecondary = true; end
+        if cfg.E3 == 1, nMot = 3; hasSecondary = true; end
+        if cfg.E4 == 1, nMot = 4; hasSecondary = true; end
+        if ~isfield(cfg, 'Pwr_EV_max_kW') || cfg.Pwr_EV_max_kW <= 0, cfg.Pwr_EV_max_kW = oldPwr / nMot; end
+        if ~isfield(cfg, 'tq_EV_max') || cfg.tq_EV_max <= 0, cfg.tq_EV_max = oldTq / nMot; end
+        if ~isfield(cfg, 'n_EV_max') || cfg.n_EV_max <= 0, cfg.n_EV_max = oldN; end
+        if ~isfield(cfg, 'Pwr_EV_nmax_red_perc'), cfg.Pwr_EV_nmax_red_perc = 0.04; end
+        if hasSecondary
+            if ~isfield(cfg, 'Pwr_P4_max_kW') || cfg.Pwr_P4_max_kW <= 0, cfg.Pwr_P4_max_kW = oldPwr / nMot; end
+            if ~isfield(cfg, 'tq_P4_max') || cfg.tq_P4_max <= 0, cfg.tq_P4_max = oldTq / nMot; end
+            if ~isfield(cfg, 'n_P4_max') || cfg.n_P4_max <= 0, cfg.n_P4_max = oldN; end
+        end
+
+        cfg.P0 = 0; cfg.P2 = 0; cfg.P3 = 0; cfg.P4 = 0; cfg.P4_DM = 0;
+    elseif isfield(cfg, 'Hy') && cfg.Hy == 1
+        cfg.VM = 0;
+        cfg.EV = 0;
+    end
+    % P4 single motor and P4 dual-motor are mutually exclusive. Prefer P4_DM.
+    if isfield(cfg, 'P4') && isfield(cfg, 'P4_DM') && cfg.P4 == 1 && cfg.P4_DM == 1
+        if isfield(cfg, 'RUN_ID')
+            fprintf('WARNING RunID %d: P4 and P4_DM are both 1. Setting P4=0 and keeping P4_DM=1.\n', cfg.RUN_ID);
+        else
+            fprintf('WARNING: P4 and P4_DM are both 1. Setting P4=0 and keeping P4_DM=1.\n');
+        end
+        cfg.P4 = 0;
+    end
     
     if isfield(cfg, 'RUN_ID'), runID = cfg.RUN_ID;
     else, runID = i; end
@@ -237,12 +332,11 @@ for i = start_idx:end_idx
     cp.tq_P4_max = cfg.tq_P4_max;
     cp.Pwr_P4_max_kW = cfg.Pwr_P4_max_kW;
     cp.Pwr_P4_nmax_red_perc = cfg.Pwr_P4_nmax_red_perc;
-    % Enable For EV -----------------------------------------EV------------
-    %cp.n_EV_max = cfg.n_EV_max;
-    %cp.tq_EV_max = cfg.tq_EV_max;
-    %cp.Pwr_EV_max_kW = cfg.Pwr_EV_max_kW;
-    %cp.Pwr_EV_nmax_red_perc = cfg.Pwr_EV_nmax_red_perc;
-   % ----------------------------------------------------EV----------------
+    % --- EV Component Params ---
+    if isfield(cfg, 'n_EV_max'), cp.n_EV_max = cfg.n_EV_max; else, cp.n_EV_max = 16000; end
+    if isfield(cfg, 'tq_EV_max'), cp.tq_EV_max = cfg.tq_EV_max; else, cp.tq_EV_max = 0; end
+    if isfield(cfg, 'Pwr_EV_max_kW'), cp.Pwr_EV_max_kW = cfg.Pwr_EV_max_kW; else, cp.Pwr_EV_max_kW = 0; end
+    if isfield(cfg, 'Pwr_EV_nmax_red_perc'), cp.Pwr_EV_nmax_red_perc = cfg.Pwr_EV_nmax_red_perc; else, cp.Pwr_EV_nmax_red_perc = 0.04; end
 
 
     cp = cp.computeICEMap(cfg.VM, cfg.Hy); 
@@ -250,15 +344,13 @@ for i = start_idx:end_idx
     if isfield(cfg, 'P2'), cp = cp.computeP2Map(cfg.P2); end
     if isfield(cfg, 'P3'), cp = cp.computeP3Map(cfg.P3); end
     
-    if isfield(cfg, 'E0'), cp = cp.computeEVMap(cfg.E0); end
-    if isfield(cfg, 'E1'), cp = cp.computeEVMap(cfg.E1); end
-
-    % ----------------------------------------------------EV----------------
-    %if isfield(cfg, 'E2'), cp = cp.computeEVMap(cfg.E2); end
-    %if isfield(cfg, 'E3'), cp = cp.computeEVMap(cfg.E3); end
-    %if isfield(cfg, 'E4'), cp = cp.computeEVMap(cfg.E4); end
-    % ----------------------------------------------------EV----------------
-
+    val_E0 = 0; if isfield(cfg, 'E0'), val_E0 = cfg.E0; end
+    val_E1 = 0; if isfield(cfg, 'E1'), val_E1 = cfg.E1; end
+    val_E2 = 0; if isfield(cfg, 'E2'), val_E2 = cfg.E2; end
+    val_E3 = 0; if isfield(cfg, 'E3'), val_E3 = cfg.E3; end
+    val_E4 = 0; if isfield(cfg, 'E4'), val_E4 = cfg.E4; end
+    val_EV_primary = double(any([val_E0, val_E1, val_E2, val_E3, val_E4]));
+    cp = cp.computeEVMap(val_EV_primary);
 
     val_P4 = 0; if isfield(cfg, 'P4'), val_P4 = cfg.P4; end
     val_P4_DM = 0; if isfield(cfg, 'P4_DM'), val_P4_DM = cfg.P4_DM; end
@@ -277,7 +369,7 @@ for i = start_idx:end_idx
     val_E4    = 0; if isfield(cfg, 'E4'),    val_E4    = cfg.E4;    end
 
     
-    cp = cp.computeP4Map(val_P4, 0, val_P4_DM, 0, 0);
+    cp = cp.computeP4Map(val_P4, val_E2, val_P4_DM, val_E3, val_E4);
 
     % setup_turbo; % Beta/future scope
 
@@ -296,13 +388,41 @@ for i = start_idx:end_idx
     end
     gb.Gears = 1:max(0, gb.No_Gears);
     gb.pedal_pos = 0:0.1:1;
-    if cfg.VM || cfg.Hy == 1
+
+    isPureEV = isfield(cfg, 'EV') && cfg.EV == 1 && ...
+               (~isfield(cfg, 'VM') || cfg.VM == 0) && ...
+               (~isfield(cfg, 'Hy') || cfg.Hy == 0);
+
+    if isPureEV
+        % Pure EV rows do not use the ICE multi-speed branch, but Simulink
+        % still parses the inactive lookup blocks during model compilation.
+        % Therefore the EV row still needs a valid dummy 2D gearbox/RPM map.
+        if isempty(gb.Gear_Ratio)
+            gb.Gear_Ratio = 1;
+        end
+        if isempty(gb.No_Gears) || ~isfinite(gb.No_Gears) || gb.No_Gears < 1
+            gb.No_Gears = numel(gb.Gear_Ratio);
+        end
+        if gb.No_Gears < 1
+            gb.No_Gears = 1;
+        end
+        gb.Gears = 1:gb.No_Gears;
+    elseif cfg.VM || cfg.Hy == 1
         if isempty(gb.Gear_Ratio) || gb.No_Gears < 1
             fprintf('WARNING RunID %d: Gear_Ratio/No_Gears missing although VM/Hy active. Using GearboxConfig.computeRatios() defaults.\n', runID);
             gb = gb.computeRatios();
         end
         gb = gb.computeShiftMaps();
     end
+
+    % Always provide 2D RPM lookup tables for the Simulink gearbox selector.
+    % This prevents EV rows from failing in the inactive ICE multi-speed branch
+    % with "Table data is 1D, Number of table dimensions is 2".
+    [gb, n_min_Upmin, n_max_Upmin] = ensureShiftLookupMaps2D(gb, cfg, cp, runID);
+
+    % Re-apply the in-memory block patch after each row. This is cheap and
+    % protects against model/link refreshes before sim() compiles the model.
+    patchGearRatioLookupBreakpoints(DOE_SL_MODEL_SIM_NAME);
 
     % ShiftDelay 
     [gb.shiftDelay, shiftSrc, gbType, p2w] = resolveShiftDelay(cfg);
@@ -359,9 +479,27 @@ for i = start_idx:end_idx
     % Simulink reads SKO_WHEEL_TYP_CHAL, cw, A_front directly from base workspace.
     veh.cw      = cw;
 
-    %% Place holder
-    current_result = struct();
-    current_result.RUN_ID = runID; 
+    %% Result / diagnostics placeholder
+    current_result = initRunResult(cfg, runID, inputWarnings);
+    current_result.ShiftDelay_used = gb.shiftDelay;
+    current_result.ShiftDelay_source = string(shiftSrc);
+    current_result.Gearbox_type_resolved = string(gbType);
+    current_result.Power_to_weight_kW_per_t = p2w;
+    current_result.GearCount_used = gb.No_Gears;
+    current_result.GearRatio_used = string(mat2str(gb.Gear_Ratio));
+    current_result.SimStatus = "SETUP_OK";
+
+    % Make actual Vmax/targets visible to optional Simulink stop/KPI blocks.
+    vmaxLimit = getNumericField(cfg, 'Actual_max_speed_kmh', NaN);
+    if ~isfinite(vmaxLimit) || vmaxLimit <= 0
+        vmaxLimit = NaN;
+    end
+    try
+        assignin('base', 'Actual_max_speed_kmh', vmaxLimit);
+        assignin('base', 'vmax_limit_kmh', vmaxLimit);
+        assignin('base', 'SL_target_vmax_kmh', vmaxLimit);
+    catch
+    end
 
     % %% === RUN SIMULATION 1: Main Model ===
     % simOut_Main = [];
@@ -380,14 +518,21 @@ for i = start_idx:end_idx
     simOut_SL = [];
     try
         simOut_SL = sim(DOE_SL_MODEL_SIM_NAME);
+        current_result.SimStatus = "OK";
     catch ME
+        current_result.SimStatus = "SIM_ERROR";
+        current_result.ErrorMessage = string(ME.message);
         fprintf('!!! CRITICAL ERROR SL Model (RunID: %d) !!!\n', runID);
         fprintf('%s\n', getReport(ME, 'extended', 'hyperlinks', 'off'));
     end
 
-    % Extract SL
-    vars_SL = {'time_0_to_100', 'time_0_to_200', 'time_80_to_120', 'time_60_to_120', 'max_speed', 'max_launch_acc'};
+    % Extract SL. Missing variables are written as NaN, so this stays
+    % compatible with the current SLX and with future diagnostic outputs.
+    vars_SL = {'time_0_to_100', 'time_0_to_200', 'time_80_to_120', 'time_60_to_120', ...
+               'max_speed', 'max_launch_acc', 'v_final_kmh', 'v_max_kmh', ...
+               'stop_reason', 'Reached_100', 'Reached_200', 'Reached_80_120', 'Reached_60_120'};
     current_result = extractVars(simOut_SL, vars_SL, current_result, 'SL_');
+    current_result = sanitizeStraightLineKpis(current_result);
 
     %% === APPEND OUTPUTS ===
 
@@ -617,7 +762,7 @@ function results_table = addActualComparison(results_table, actual_values_filena
 
     actualFile = char(string(actual_values_filename));
     if isempty(actualFile) || ~isfile(actualFile)
-        fprintf('Actual values file not found or not set. Skipping comparison columns.\n');
+        fprintf('Actual values file not found or not set. Using Actual_* columns from results only.\n');
         return;
     end
 
@@ -634,23 +779,33 @@ function results_table = addActualComparison(results_table, actual_values_filena
         return;
     end
 
-    actualCol = find(contains(lower(actualVars), 'actual') & contains(actualVars, '100'), 1);
-    if isempty(actualCol)
-        candidateCols = setdiff(1:numel(actualVars), runCol);
-        if isempty(candidateCols)
-            fprintf('Actual values file has no value column. Skipping comparison columns.\n');
-            return;
-        end
-        actualCol = candidateCols(1);
-    end
-
     resultRunIDs = str2double(string(results_table.RUN_ID));
     actualRunIDs = str2double(string(actualT{:, runCol}));
-    actualVals = str2double(string(actualT{:, actualCol}));
-
     [tf, loc] = ismember(resultRunIDs, actualRunIDs);
-    results_table.Actual_0_to_100_s = NaN(height(results_table), 1);
-    results_table.Actual_0_to_100_s(tf) = actualVals(loc(tf));
+
+    actual0100Col = find(strcmpi(actualVars, 'Actual_0_to_100_s'), 1);
+    if isempty(actual0100Col)
+        actual0100Col = find(contains(lower(actualVars), 'actual') & contains(actualVars, '100'), 1);
+    end
+    if ~isempty(actual0100Col)
+        actualVals = str2double(string(actualT{:, actual0100Col}));
+        if ~ismember('Actual_0_to_100_s', results_table.Properties.VariableNames)
+            results_table.Actual_0_to_100_s = NaN(height(results_table), 1);
+        end
+        results_table.Actual_0_to_100_s(tf) = actualVals(loc(tf));
+    end
+
+    actualVmaxCol = find(strcmpi(actualVars, 'Actual_max_speed_kmh'), 1);
+    if isempty(actualVmaxCol)
+        actualVmaxCol = find(contains(lower(actualVars), 'actual') & contains(lower(actualVars), 'max') & contains(lower(actualVars), 'speed'), 1);
+    end
+    if ~isempty(actualVmaxCol)
+        actualVmax = str2double(string(actualT{:, actualVmaxCol}));
+        if ~ismember('Actual_max_speed_kmh', results_table.Properties.VariableNames)
+            results_table.Actual_max_speed_kmh = NaN(height(results_table), 1);
+        end
+        results_table.Actual_max_speed_kmh(tf) = actualVmax(loc(tf));
+    end
 
     simCol = '';
     if ismember('SL_time_0_to_100', results_table.Properties.VariableNames)
@@ -659,10 +814,24 @@ function results_table = addActualComparison(results_table, actual_values_filena
         simCol = 'time_0_to_100';
     end
 
-    if ~isempty(simCol)
+    if ~isempty(simCol) && ismember('Actual_0_to_100_s', results_table.Properties.VariableNames)
         simVals = str2double(string(results_table.(simCol)));
-        results_table.Error_0_to_100_s = simVals - results_table.Actual_0_to_100_s;
-        results_table.Error_0_to_100_pct = 100 .* results_table.Error_0_to_100_s ./ results_table.Actual_0_to_100_s;
+        actualVals = str2double(string(results_table.Actual_0_to_100_s));
+        results_table.Error_0_to_100_s = simVals - actualVals;
+        results_table.Error_0_to_100_pct = 100 .* results_table.Error_0_to_100_s ./ actualVals;
+    end
+
+    maxCol = '';
+    if ismember('SL_v_max_kmh', results_table.Properties.VariableNames)
+        maxCol = 'SL_v_max_kmh';
+    elseif ismember('SL_max_speed', results_table.Properties.VariableNames)
+        maxCol = 'SL_max_speed';
+    end
+    if ~isempty(maxCol) && ismember('Actual_max_speed_kmh', results_table.Properties.VariableNames)
+        simV = str2double(string(results_table.(maxCol)));
+        actualV = str2double(string(results_table.Actual_max_speed_kmh));
+        results_table.Error_max_speed_kmh = simV - actualV;
+        results_table.Error_max_speed_pct = 100 .* results_table.Error_max_speed_kmh ./ actualV;
     end
 end
 
@@ -679,6 +848,648 @@ function mainStruct = appendStruct(mainStruct, newStruct)
     end
     mainStruct = [mainStruct; newStruct];
 end
+
+
+
+function [cfg, warnings, errors] = validateAndRepairInput(cfg, runID)
+    warnings = strings(1, 0);
+    errors = strings(1, 0);
+
+    % Required numeric defaults. These keep older CSVs compatible with the
+    % newer AMS converter output.
+    numericDefaults = { ...
+        'd_wheel', 0.6345; 'A_front', 2.25; 'HM_VA', 1; 'AWD', 0; 'iAG', 4.1; ...
+        'm_curb', 1500; 'Wheelbase', 2.65; 'h_s', 0.45; 'weight_dist', 1.20; ...
+        'MainAxle_TorqueSplit_int', 0.5; 'Hybrid_ICE_priority', 1; ...
+        'VM', 1; 'EV', 0; 'Hy', 0; 'E0', 0; 'E1', 0; 'E2', 0; 'E3', 0; 'E4', 0; ...
+        'i_GET_EV', 9.0; 'i_ges_P4', 9.0; 'use_cus_val', 1; 'No_Gears', 0; 'shiftDelay', NaN; ...
+        'Displacement_cc', 0; 'Boost_Pressure_bar', 0; ...
+        'P0', 0; 'P2', 0; 'P3', 0; 'P4', 0; 'P4_DM', 0; ...
+        'n_ICE_idle', 0; 'n_ICE_max', 0; 'tq_ICE_idle', 0; 'tq_ICE_max', 0; 'Pwr_ICE_max_kW', 0; ...
+        'tq_P0_max', 0; 'Pwr_P0_max_kW', 0; 'n_P0_max', 0; 'Pwr_P0_nmax_red_perc', 0; ...
+        'tq_P2_max', 0; 'Pwr_P2_max_kW', 0; 'n_P2_max', 0; 'Pwr_P2_nmax_red_perc', 0; ...
+        'tq_P3_max', 0; 'Pwr_P3_max_kW', 0; 'n_P3_max', 0; 'Pwr_P3_nmax_red_perc', 0; ...
+        'tq_P4_max', 0; 'Pwr_P4_max_kW', 0; 'n_P4_max', 0; 'Pwr_P4_nmax_red_perc', 0; ...
+        'tq_EV_max', 0; 'Pwr_EV_max_kW', 0; 'n_EV_max', 0; 'Pwr_EV_nmax_red_perc', 0.04; ...
+        'Cell_Cap_Ah', 4.8; 'Cell_V_nom', 3.7; 'Cell_R_inner', 0.023; ...
+        'Cell_V_min', 2.5; 'Cell_V_max', 4.2; 'Cell_I_max_chg', 4.8; 'Cell_I_max_dis', 15; ...
+        'n_s', 1; 'n_p', 1; 'facSocInit', 0.95; 'SOC_Recup_Limit', 0.95; 'SOC_Bat_Discharge_Limit', 0.10; ...
+        'Actual_0_to_100_s', NaN; 'Actual_max_speed_kmh', NaN; 'InputQualityScore', NaN};
+    for k = 1:size(numericDefaults, 1)
+        [cfg, wasDefaulted] = ensureNumericField(cfg, numericDefaults{k,1}, numericDefaults{k,2});
+        if wasDefaulted
+            warnings(end+1) = string(numericDefaults{k,1}) + " defaulted"; %#ok<AGROW>
+        end
+    end
+
+    textDefaults = {'Powertrain', ''; 'mode', 'performance'; 'Gear_Ratio', '[]'; ...
+        'Induction_Type', 'NA'; 'SOC_Vector', '[0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]'; ...
+        'Cell_OCV_Vector', '[2.8, 3.3, 3.45, 3.52, 3.60, 3.68, 3.75, 3.85, 3.95, 4.1, 4.2]'; ...
+        'Raw_Gearbox', ''; 'Raw_Fuel', ''; 'Transmission_Type', ''; 'Vehicle_Name', ''; 'InputWarnings', ''};
+    for k = 1:size(textDefaults, 1)
+        if ~isfield(cfg, textDefaults{k,1}) || isempty(cfg.(textDefaults{k,1})) || ismissing(string(cfg.(textDefaults{k,1})))
+            cfg.(textDefaults{k,1}) = string(textDefaults{k,2});
+        end
+    end
+
+    pt = upper(strtrim(string(cfg.Powertrain)));
+    if strlength(pt) == 0 || pt == "0" || pt == "UNKNOWN"
+        if cfg.EV == 1
+            pt = "EV";
+        elseif cfg.Hy == 1
+            pt = "HYBRID";
+        else
+            pt = "ICE";
+        end
+        cfg.Powertrain = pt;
+        warnings(end+1) = "Powertrain inferred from flags"; %#ok<AGROW>
+    end
+
+    isICE = pt == "ICE";
+    isEV = pt == "EV" || pt == "BEV";
+    isHybrid = pt == "HYBRID" || pt == "PHEV" || pt == "HEV";
+
+    if isICE
+        cfg.Powertrain = "ICE";
+        cfg.VM = 1; cfg.EV = 0; cfg.Hy = 0;
+        cfg.P0 = 0; cfg.P2 = 0; cfg.P3 = 0; cfg.P4 = 0; cfg.P4_DM = 0;
+        cfg.E0 = 0; cfg.E1 = 0; cfg.E2 = 0; cfg.E3 = 0; cfg.E4 = 0;
+        cfg.tq_P0_max = 0; cfg.Pwr_P0_max_kW = 0; cfg.n_P0_max = 0;
+        cfg.tq_P2_max = 0; cfg.Pwr_P2_max_kW = 0; cfg.n_P2_max = 0;
+        cfg.tq_P3_max = 0; cfg.Pwr_P3_max_kW = 0; cfg.n_P3_max = 0;
+        cfg.tq_P4_max = 0; cfg.Pwr_P4_max_kW = 0; cfg.n_P4_max = 0;
+        cfg.tq_EV_max = 0; cfg.Pwr_EV_max_kW = 0; cfg.n_EV_max = 0;
+        cfg.n_s = max(1, cfg.n_s); cfg.n_p = max(1, cfg.n_p);
+    elseif isEV
+        cfg.Powertrain = "EV";
+        cfg.VM = 0; cfg.EV = 1; cfg.Hy = 0;
+        oldPwr = max([cfg.Pwr_EV_max_kW, cfg.Pwr_P2_max_kW, cfg.Pwr_P3_max_kW, cfg.Pwr_P4_max_kW, cfg.Pwr_ICE_max_kW]);
+        oldTq  = max([cfg.tq_EV_max, cfg.tq_P2_max, cfg.tq_P3_max, cfg.tq_P4_max, cfg.tq_ICE_max]);
+        oldN   = max([cfg.n_EV_max, cfg.n_P2_max, cfg.n_P3_max, cfg.n_P4_max, 16000]);
+        cfg.Pwr_ICE_max_kW = 0; cfg.tq_ICE_max = 0; cfg.tq_ICE_idle = 0; cfg.n_ICE_idle = 0; cfg.n_ICE_max = 0;
+        if ~(cfg.E0 || cfg.E1 || cfg.E2 || cfg.E3 || cfg.E4)
+            if cfg.AWD == 1
+                cfg.E2 = 1;
+            else
+                cfg.E0 = 1;
+            end
+            warnings(end+1) = "EV E-position inferred"; %#ok<AGROW>
+        end
+        nMot = max(1, 1 + double(cfg.E1 == 1 || cfg.E2 == 1) + double(cfg.E3 == 1) * 2 + double(cfg.E4 == 1) * 3);
+        if cfg.Pwr_EV_max_kW <= 0 && oldPwr > 0, cfg.Pwr_EV_max_kW = oldPwr / nMot; end
+        if cfg.tq_EV_max <= 0 && oldTq > 0, cfg.tq_EV_max = oldTq / nMot; end
+        if cfg.n_EV_max <= 0, cfg.n_EV_max = oldN; end
+        if cfg.Pwr_P4_max_kW <= 0 && (cfg.E2 || cfg.E3 || cfg.E4), cfg.Pwr_P4_max_kW = cfg.Pwr_EV_max_kW; end
+        if cfg.tq_P4_max <= 0 && (cfg.E2 || cfg.E3 || cfg.E4), cfg.tq_P4_max = cfg.tq_EV_max; end
+        if cfg.n_P4_max <= 0 && (cfg.E2 || cfg.E3 || cfg.E4), cfg.n_P4_max = cfg.n_EV_max; end
+        cfg.P0 = 0; cfg.P2 = 0; cfg.P3 = 0; cfg.P4 = 0; cfg.P4_DM = 0;
+    elseif isHybrid
+        cfg.Powertrain = "Hybrid";
+        cfg.EV = 0; cfg.Hy = 1;
+        if cfg.Pwr_ICE_max_kW <= 0
+            errors(end+1) = "Hybrid has no ICE power"; %#ok<AGROW>
+        end
+        if cfg.P0 + cfg.P2 + cfg.P3 + cfg.P4 + cfg.P4_DM == 0 && max([cfg.Pwr_P0_max_kW, cfg.Pwr_P2_max_kW, cfg.Pwr_P3_max_kW, cfg.Pwr_P4_max_kW]) > 0
+            cfg.P2 = 1;
+            warnings(end+1) = "Hybrid P-position inferred as P2"; %#ok<AGROW>
+        end
+    else
+        errors(end+1) = "Unknown Powertrain value: " + string(cfg.Powertrain); %#ok<AGROW>
+    end
+
+    % P4 single motor and dual-motor architecture are mutually exclusive.
+    if cfg.P4 == 1 && cfg.P4_DM == 1
+        cfg.P4 = 0;
+        warnings(end+1) = "P4/P4_DM conflict repaired; kept P4_DM"; %#ok<AGROW>
+    end
+
+    gr = parseNumericVector(cfg.Gear_Ratio);
+    if cfg.EV == 1 && cfg.Hy == 0 && cfg.VM == 0
+        cfg.Gear_Ratio = "[1]";
+        cfg.No_Gears = 1;
+        cfg.i_GET_EV = max(cfg.i_GET_EV, 1);
+    else
+        if isempty(gr) || numel(gr) < 2 || cfg.No_Gears < 2
+            nG = max(2, estimateGearCountMain(cfg));
+            gr = defaultGearRatiosMain(nG, getTextField(cfg, 'Raw_Gearbox'));
+            cfg.Gear_Ratio = formatVectorMain(gr);
+            cfg.No_Gears = numel(gr);
+            warnings(end+1) = "ICE/Hybrid gearbox ratios repaired"; %#ok<AGROW>
+        else
+            cfg.No_Gears = numel(gr);
+        end
+    end
+
+    cfg.facSocInit = normalizeSocFraction(cfg.facSocInit, 0.95);
+    cfg.SOC_Recup_Limit = normalizeSocFraction(cfg.SOC_Recup_Limit, 0.95);
+    cfg.SOC_Bat_Discharge_Limit = normalizeSocFraction(cfg.SOC_Bat_Discharge_Limit, 0.10);
+    if cfg.SOC_Bat_Discharge_Limit >= cfg.SOC_Recup_Limit
+        cfg.SOC_Bat_Discharge_Limit = 0.10;
+        cfg.SOC_Recup_Limit = 0.95;
+        warnings(end+1) = "SOC limits repaired"; %#ok<AGROW>
+    end
+
+    if cfg.m_curb <= 200 || cfg.A_front <= 1.0 || cfg.Wheelbase <= 1.5
+        errors(end+1) = "Invalid basic vehicle geometry/mass"; %#ok<AGROW>
+    end
+    totalPower = max([cfg.Pwr_ICE_max_kW, 0]) + max([cfg.Pwr_P0_max_kW, 0]) + max([cfg.Pwr_P2_max_kW, 0]) + ...
+                 max([cfg.Pwr_P3_max_kW, 0]) + max([cfg.Pwr_P4_max_kW, 0]) + max([cfg.Pwr_EV_max_kW, 0]);
+    if totalPower <= 0
+        errors(end+1) = "No usable propulsion power"; %#ok<AGROW>
+    end
+
+    % Merge converter warnings with main repair warnings.
+    oldWarn = strtrim(string(getTextField(cfg, 'InputWarnings')));
+    if strlength(oldWarn) > 0 && oldWarn ~= "0"
+        warnings = [split(oldWarn, " | ").', warnings]; %#ok<AGROW>
+    end
+    warnings = unique(warnings(strlength(warnings) > 0), 'stable');
+    cfg.InputWarnings = strjoin(warnings, " | ");
+    if ~isfinite(cfg.InputQualityScore)
+        cfg.InputQualityScore = max(0, 100 - 5 * numel(warnings) - 20 * numel(errors));
+    end
+
+    if ~isempty(warnings)
+        fprintf('RunID %d input warnings: %s\n', runID, char(strjoin(warnings, ' | ')));
+    end
+end
+
+function current_result = initRunResult(cfg, runID, inputWarnings)
+    current_result = struct();
+    current_result.RUN_ID = runID;
+    current_result.Vehicle_Name = string(getTextField(cfg, 'Vehicle_Name'));
+    current_result.Powertrain = string(getTextField(cfg, 'Powertrain'));
+    current_result.Actual_0_to_100_s = getNumericField(cfg, 'Actual_0_to_100_s', NaN);
+    current_result.Actual_max_speed_kmh = getNumericField(cfg, 'Actual_max_speed_kmh', NaN);
+    current_result.InputQualityScore = getNumericField(cfg, 'InputQualityScore', NaN);
+    current_result.InputWarnings = string(strjoin(inputWarnings, ' | '));
+    current_result.InputErrors = "";
+    current_result.SimStatus = "INIT";
+    current_result.ErrorMessage = "";
+end
+
+function current_result = makeSkippedResult(cfg, runID, inputWarnings, inputErrors)
+    current_result = initRunResult(cfg, runID, inputWarnings);
+    current_result.InputErrors = string(strjoin(inputErrors, ' | '));
+    current_result.SimStatus = "SKIPPED_INPUT_ERROR";
+    fields = {'SL_time_0_to_100','SL_time_0_to_200','SL_time_80_to_120','SL_time_60_to_120', ...
+              'SL_max_speed','SL_max_launch_acc','SL_v_final_kmh','SL_v_max_kmh'};
+    for k = 1:numel(fields)
+        current_result.(fields{k}) = NaN;
+    end
+    current_result.SL_Reached_100 = false;
+    current_result.SL_Reached_200 = false;
+    current_result.SL_Reached_80_120 = false;
+    current_result.SL_Reached_60_120 = false;
+end
+
+function current_result = sanitizeStraightLineKpis(current_result)
+    pairs = {'SL_time_0_to_100','SL_Reached_100'; 'SL_time_0_to_200','SL_Reached_200'; ...
+             'SL_time_80_to_120','SL_Reached_80_120'; 'SL_time_60_to_120','SL_Reached_60_120'};
+    for k = 1:size(pairs, 1)
+        tName = pairs{k,1}; rName = pairs{k,2};
+        if isfield(current_result, tName)
+            val = double(current_result.(tName));
+            if ~isfinite(val) || val <= 0
+                current_result.(tName) = NaN;
+                current_result.(rName) = false;
+            else
+                current_result.(rName) = true;
+            end
+        else
+            current_result.(tName) = NaN;
+            current_result.(rName) = false;
+        end
+    end
+    if isfield(current_result, 'SL_v_max_kmh') && isfinite(double(current_result.SL_v_max_kmh))
+        current_result.SL_max_speed_physical = current_result.SL_v_max_kmh;
+    elseif isfield(current_result, 'SL_max_speed')
+        current_result.SL_max_speed_physical = current_result.SL_max_speed;
+    else
+        current_result.SL_max_speed_physical = NaN;
+    end
+end
+
+function [delay, source, gbType, p2w] = resolveShiftDelay(cfg)
+    gbText = lower(string(getTextField(cfg, 'Raw_Gearbox')) + " " + string(getTextField(cfg, 'Transmission_Type')));
+    pt = upper(string(getTextField(cfg, 'Powertrain')));
+    totalPower = getNumericField(cfg, 'Pwr_ICE_max_kW', 0) + getNumericField(cfg, 'Pwr_P0_max_kW', 0) + ...
+                 getNumericField(cfg, 'Pwr_P2_max_kW', 0) + getNumericField(cfg, 'Pwr_P3_max_kW', 0) + ...
+                 getNumericField(cfg, 'Pwr_P4_max_kW', 0) + getNumericField(cfg, 'Pwr_EV_max_kW', 0);
+    m = getNumericField(cfg, 'm_curb', NaN);
+    if isfinite(m) && m > 0
+        p2w = totalPower / m * 1000;
+    else
+        p2w = NaN;
+    end
+
+    if pt == "EV"
+        delay = 0.05; source = "ev_single_speed"; gbType = "single_speed_ev"; return;
+    end
+    if containsAnyMain(gbText, ["doppelkuppl", "dsg", "pdk", "s tronic", "m dct"])
+        gbType = "dct";
+        if isfinite(p2w) && p2w > 250, delay = 0.10; else, delay = 0.18; end
+        source = "gearbox_text";
+    elseif containsAnyMain(gbText, ["automatik", "wandler", "tiptronic", "steptronic", "zf"])
+        gbType = "automatic"; delay = 0.35; source = "gearbox_text";
+    elseif containsAnyMain(gbText, ["schalt", "manuell"])
+        gbType = "manual"; delay = 0.80; source = "gearbox_text";
+    else
+        gbType = "unknown";
+        csvDelay = getNumericField(cfg, 'shiftDelay', NaN);
+        if isfinite(csvDelay) && csvDelay > 0.03 && csvDelay < 1.5
+            delay = csvDelay; source = "csv_shiftDelay";
+        elseif ~isfinite(p2w) || p2w < 80
+            delay = 1.00; source = "power_to_weight_fallback";
+        elseif p2w < 140
+            delay = 0.70; source = "power_to_weight_fallback";
+        elseif p2w < 250
+            delay = 0.45; source = "power_to_weight_fallback";
+        else
+            delay = 0.10; source = "power_to_weight_fallback";
+        end
+    end
+end
+
+function [s, wasDefaulted] = ensureNumericField(s, fieldName, defaultVal)
+    wasDefaulted = false;
+    if ~isfield(s, fieldName) || isempty(s.(fieldName))
+        s.(fieldName) = defaultVal; wasDefaulted = true; return;
+    end
+    val = s.(fieldName);
+    if isstring(val) || ischar(val)
+        tmp = str2double(string(val));
+        if isfinite(tmp)
+            s.(fieldName) = tmp; return;
+        end
+    elseif isnumeric(val) || islogical(val)
+        if isscalar(val) && isfinite(double(val))
+            s.(fieldName) = double(val); return;
+        end
+    end
+    s.(fieldName) = defaultVal;
+    wasDefaulted = true;
+end
+
+function v = getNumericField(s, fieldName, defaultVal)
+    v = defaultVal;
+    if isstruct(s) && isfield(s, fieldName)
+        tmp = s.(fieldName);
+        if isstring(tmp) || ischar(tmp)
+            tmp = str2double(string(tmp));
+        end
+        if isnumeric(tmp) || islogical(tmp)
+            tmp = double(tmp);
+            if isscalar(tmp) && isfinite(tmp)
+                v = tmp;
+            end
+        end
+    end
+end
+
+function txt = getTextField(s, fieldName)
+    txt = "";
+    if isstruct(s) && isfield(s, fieldName) && ~isempty(s.(fieldName))
+        txt = string(s.(fieldName));
+        if ismissing(txt), txt = ""; end
+    end
+end
+
+function x = normalizeSocFraction(x, defaultVal)
+    if ~isfinite(x), x = defaultVal; end
+    if x > 1.5, x = x / 100; end
+    x = min(max(x, 0), 1);
+end
+
+function nG = estimateGearCountMain(cfg)
+    txt = lower(string(getTextField(cfg, 'Raw_Gearbox')));
+    nG = getNumericField(cfg, 'No_Gears', NaN);
+    if isfinite(nG) && nG > 1, nG = round(nG); return; end
+    if containsAnyMain(txt, ["doppelkuppl", "dsg", "pdk", "s tronic", "m dct"])
+        nG = 7;
+    elseif containsAnyMain(txt, ["automatik", "wandler", "tiptronic", "steptronic", "zf"])
+        nG = 8;
+    elseif containsAnyMain(txt, ["schalt", "manuell"])
+        nG = 6;
+    else
+        nG = 6;
+    end
+end
+
+function gr = defaultGearRatiosMain(nG, gearboxText)
+    nG = max(2, round(nG));
+    txt = lower(string(gearboxText));
+    if nG == 5
+        gr = [3.54 2.05 1.32 1.03 0.85];
+    elseif nG == 6
+        gr = [4.05 2.40 1.58 1.19 1.00 0.87];
+    elseif nG == 7
+        gr = [4.38 2.86 1.92 1.37 1.00 0.82 0.64];
+    elseif nG >= 8
+        if containsAnyMain(txt, ["automatik", "wandler", "zf"])
+            gr = [5.00 3.20 2.14 1.72 1.31 1.00 0.82 0.64];
+        else
+            gr = [4.71 3.14 2.11 1.67 1.29 1.00 0.84 0.67];
+        end
+        gr = gr(1:min(nG, numel(gr)));
+    else
+        gr = linspace(3.8, 0.9, nG);
+    end
+end
+
+function s = formatVectorMain(v)
+    parts = strings(1, numel(v));
+    for k = 1:numel(v)
+        parts(k) = string(sprintf('%.5g', v(k)));
+    end
+    s = "[" + strjoin(parts, ", ") + "]";
+end
+
+function tf = containsAnyMain(txt, patterns)
+    txt = lower(string(txt));
+    patterns = lower(string(patterns));
+    tf = false;
+    for k = 1:numel(patterns)
+        if contains(txt, patterns(k))
+            tf = true; return;
+        end
+    end
+end
+
+function patchGearRatioLookupBreakpoints(modelName)
+    % Patch model-in-memory only. Do not save the SLX.
+    %
+    % Reason: Lookup_n-D blocks for Gang -> i_GET originally use
+    %   BreakpointsForDimension1 = [1:1:gb.No_Gears]
+    %   Table                    = gb.Gear_Ratio
+    %
+    % For No_Gears = 1 this has only one breakpoint and Simulink rejects the
+    % model. Do not change gb.No_Gears, because it is also used by the shift
+    % logic. Instead, route these lookup blocks to dedicated LUT variables:
+    %   gb_Gears_LUT       = [1 2] for one-speed rows, otherwise 1:nGear
+    %   gb_Gear_Ratio_LUT  = duplicated ratio for one-speed rows
+    try
+        if ~bdIsLoaded(modelName)
+            return;
+        end
+
+        lookupBlocks = find_system(modelName, ...
+            'LookUnderMasks', 'all', ...
+            'FollowLinks', 'on', ...
+            'BlockType', 'Lookup_n-D');
+
+        nPatched = 0;
+        for k = 1:numel(lookupBlocks)
+            try
+                tbl = strtrim(get_param(lookupBlocks{k}, 'Table'));
+                bp1 = strtrim(get_param(lookupBlocks{k}, 'BreakpointsForDimension1'));
+                blockName = get_param(lookupBlocks{k}, 'Name');
+
+                nameHasGang = ~isempty(strfind(blockName, 'Gang')); %#ok<STREMP>
+                bpUsesNoGears = ~isempty(strfind(bp1, 'gb.No_Gears')); %#ok<STREMP>
+                isGearRatioTable = strcmp(tbl, 'gb.Gear_Ratio') || strcmp(tbl, 'gb_Gear_Ratio_LUT');
+
+                if (isGearRatioTable || nameHasGang) && (isGearRatioTable || bpUsesNoGears)
+                    set_param(lookupBlocks{k}, 'BreakpointsForDimension1', 'gb_Gears_LUT');
+                    set_param(lookupBlocks{k}, 'Table', 'gb_Gear_Ratio_LUT');
+                    nPatched = nPatched + 1;
+                end
+            catch
+                % Ignore nonstandard lookup block variants.
+            end
+        end
+
+        if nPatched > 0
+            fprintf('Patched %d gearbox ratio lookup block(s): table = gb_Gear_Ratio_LUT, breakpoint = gb_Gears_LUT.\n', nPatched);
+        end
+    catch ME
+        fprintf('WARNING: Could not patch gearbox ratio lookup blocks: %s\n', ME.message);
+    end
+end
+
+function [gb, n_min_Upmin, n_max_Upmin] = ensureShiftLookupMaps2D(gb, cfg, cp, runID)
+    % Ensures that the RPM lookup tables used by the gearbox selector are 2D.
+    % Important for pure EV rows: even inactive Simulink branches are compiled.
+
+    if ~isfield(cfg, 'VM'), cfg.VM = 0; end
+    if ~isfield(cfg, 'Hy'), cfg.Hy = 0; end
+    if ~isfield(cfg, 'EV'), cfg.EV = 0; end
+
+    isPureEV = cfg.EV == 1 && cfg.VM == 0 && cfg.Hy == 0;
+
+    if ~ispropSafe(gb, 'pedal_pos') || isempty(gb.pedal_pos)
+        gb.pedal_pos = 0:0.1:1;
+    end
+    if ~ispropSafe(gb, 'Gears') || isempty(gb.Gears)
+        if ispropSafe(gb, 'No_Gears') && ~isempty(gb.No_Gears) && isfinite(gb.No_Gears) && gb.No_Gears >= 1
+            gb.Gears = 1:gb.No_Gears;
+        else
+            gb.Gears = 1;
+        end
+    end
+
+    nPedal = max(2, numel(gb.pedal_pos));
+
+    % Simulink lookup blocks require at least two points in each lookup
+    % dimension. This matters for valid one-speed DoE rows, e.g.
+    % Gear_Ratio = [1], No_Gears = 1.
+    %
+    % Do NOT change gb.No_Gears here. It is the physical gear count and is
+    % used by the shift manager. For one-speed rows gb.No_Gears stays 1, so
+    % the shift manager remains in one-gear mode. gb.Gears and gb.Gear_Ratio
+    % only get a duplicated dummy point so the lookup blocks can compile.
+    if numel(gb.Gears) < 2
+        gb.Gears = [1 2];
+    end
+
+    gb_Gear_Ratio_LUT = [];
+    if ispropSafe(gb, 'Gear_Ratio')
+        try
+            gr = gb.Gear_Ratio;
+            if isempty(gr) || ~isnumeric(gr)
+                gr = 1;
+            end
+            gr = double(gr(:).');
+            gr = gr(isfinite(gr));
+            if isempty(gr)
+                gr = 1;
+            end
+            if numel(gr) < 2
+                gr = [gr(1), gr(1)];
+            end
+            gb.Gear_Ratio = gr;
+            gb_Gear_Ratio_LUT = gr;
+        catch
+            % Keep existing object state if assignment is not supported.
+        end
+    end
+
+    if isempty(gb_Gear_Ratio_LUT)
+        gb_Gear_Ratio_LUT = ones(1, max(2, numel(gb.Gears)));
+    end
+    if numel(gb_Gear_Ratio_LUT) < 2
+        gb_Gear_Ratio_LUT = [gb_Gear_Ratio_LUT(1), gb_Gear_Ratio_LUT(1)];
+    end
+    gb_Gear_Ratio_LUT = double(gb_Gear_Ratio_LUT(:).');
+    gb_Gears_LUT = 1:numel(gb_Gear_Ratio_LUT);
+
+    nGear  = max(2, numel(gb.Gears));
+
+    if isPureEV
+        nMaxDefault  = max([getFieldOrDefault(cfg, 'n_EV_max', 0), ...
+                            getFieldOrDefault(cfg, 'n_P2_max', 0), ...
+                            getFieldOrDefault(cfg, 'n_P3_max', 0), ...
+                            getFieldOrDefault(cfg, 'n_P4_max', 0), ...
+                            getPropOrDefault(cp, 'n_EV_max', 0), ...
+                            getPropOrDefault(cp, 'n_P2_max', 0), ...
+                            getPropOrDefault(cp, 'n_P3_max', 0), ...
+                            getPropOrDefault(cp, 'n_P4_max', 0), 1000]);
+        nMinDefault = 0;
+        if ispropSafe(gb, 'max_rpm')
+            gb.max_rpm = nMaxDefault;
+        end
+    else
+        nMaxDefault = max([getFieldOrDefault(cfg, 'n_ICE_max', 0), ...
+                           getPropOrDefault(cp, 'n_ICE_max', 0), 1000]);
+        nMinDefault = max([getFieldOrDefault(cfg, 'n_ICE_idle', 0), ...
+                           getPropOrDefault(cp, 'n_ICE_idle', 0), 800]);
+    end
+
+    n_min_raw = [];
+    n_max_raw = [];
+    if ispropSafe(gb, 'n_min_Upmin')
+        n_min_raw = gb.n_min_Upmin;
+    end
+    if ispropSafe(gb, 'n_max_Upmin')
+        n_max_raw = gb.n_max_Upmin;
+    end
+
+    n_min_Upmin = normalizeLookup2D(n_min_raw, nPedal, nGear, nMinDefault);
+    n_max_Upmin = normalizeLookup2D(n_max_raw, nPedal, nGear, nMaxDefault);
+
+    % Keep max >= min for all entries.
+    n_max_Upmin = max(n_max_Upmin, n_min_Upmin + 1);
+
+    if ispropSafe(gb, 'n_min_Upmin')
+        try, gb.n_min_Upmin = n_min_Upmin; catch, end
+    end
+    if ispropSafe(gb, 'n_max_Upmin')
+        try, gb.n_max_Upmin = n_max_Upmin; catch, end
+    end
+
+    % Make the direct variables and updated gearbox object available to
+    % Simulink even if this script is triggered from another wrapper.
+    try
+        assignin('base', 'n_min_Upmin', n_min_Upmin);
+        assignin('base', 'n_max_Upmin', n_max_Upmin);
+        assignin('base', 'gb_Gears_LUT', gb_Gears_LUT);
+        assignin('base', 'gb_Gear_Ratio_LUT', gb_Gear_Ratio_LUT);
+        assignin('base', 'gb', gb);
+    catch
+    end
+    try
+        assignin('caller', 'n_min_Upmin', n_min_Upmin);
+        assignin('caller', 'n_max_Upmin', n_max_Upmin);
+        assignin('caller', 'gb_Gears_LUT', gb_Gears_LUT);
+        assignin('caller', 'gb_Gear_Ratio_LUT', gb_Gear_Ratio_LUT);
+        assignin('caller', 'gb', gb);
+    catch
+    end
+
+    fprintf('RunID %d: gearbox RPM lookup maps set to %dx%d [%s]. gearRatioLUT=%dx%d, n_min=%.0f rpm, n_max=%.0f rpm\n', ...
+        runID, size(n_max_Upmin, 1), size(n_max_Upmin, 2), ...
+        ternaryText(isPureEV, 'EV dummy map', 'ICE/Hybrid map'), ...
+        size(gb_Gear_Ratio_LUT, 1), size(gb_Gear_Ratio_LUT, 2), ...
+        min(n_min_Upmin(:)), max(n_max_Upmin(:)));
+end
+
+function M = normalizeLookup2D(raw, nRows, nCols, defaultVal)
+    if isempty(raw) || ~isnumeric(raw)
+        M = defaultVal .* ones(nRows, nCols);
+        return;
+    end
+
+    raw = double(raw);
+    raw = squeeze(raw);
+
+    if isempty(raw) || any(~isfinite(raw(:)))
+        M = defaultVal .* ones(nRows, nCols);
+    elseif isscalar(raw)
+        M = raw .* ones(nRows, nCols);
+    elseif isvector(raw)
+        v = raw(:);
+        if numel(v) == nRows
+            M = repmat(v, 1, nCols);
+        elseif numel(v) == nCols
+            M = repmat(v.', nRows, 1);
+        else
+            M = defaultVal .* ones(nRows, nCols);
+            nCopy = min(numel(v), nRows);
+            M(1:nCopy, :) = repmat(v(1:nCopy), 1, nCols);
+        end
+    else
+        if isequal(size(raw), [nRows, nCols])
+            M = raw;
+        elseif isequal(size(raw), [nCols, nRows])
+            M = raw.';
+        else
+            M = defaultVal .* ones(nRows, nCols);
+            rCopy = min(size(raw, 1), nRows);
+            cCopy = min(size(raw, 2), nCols);
+            M(1:rCopy, 1:cCopy) = raw(1:rCopy, 1:cCopy);
+        end
+    end
+
+    M = double(reshape(M, nRows, nCols));
+end
+
+function tf = ispropSafe(obj, propName)
+    try
+        tf = isprop(obj, propName);
+    catch
+        tf = false;
+    end
+end
+
+function v = getFieldOrDefault(s, fieldName, defaultVal)
+    v = defaultVal;
+    if isstruct(s) && isfield(s, fieldName)
+        tmp = s.(fieldName);
+        if ~isempty(tmp) && isnumeric(tmp)
+            tmp = double(tmp(:));
+            tmp = tmp(isfinite(tmp));
+            if ~isempty(tmp)
+                v = max(tmp);
+            end
+        end
+    end
+end
+
+function v = getPropOrDefault(obj, propName, defaultVal)
+    v = defaultVal;
+    if ispropSafe(obj, propName)
+        try
+            tmp = obj.(propName);
+            if ~isempty(tmp) && isnumeric(tmp)
+                tmp = double(tmp(:));
+                tmp = tmp(isfinite(tmp));
+                if ~isempty(tmp)
+                    v = max(tmp);
+                end
+            end
+        catch
+        end
+    end
+end
+
+function txt = ternaryText(cond, trueText, falseText)
+    if cond
+        txt = trueText;
+    else
+        txt = falseText;
+    end
+end
+
 
 function createActualVsSim0100Plot(results_table, output_file)
     % Creates an Actual-vs-Simulated 0-100 km/h comparison plot.
