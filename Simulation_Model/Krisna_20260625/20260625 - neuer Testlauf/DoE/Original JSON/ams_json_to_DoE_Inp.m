@@ -19,7 +19,7 @@ function ams_json_to_DoE_Inp(inputFile, outBase)
 %   - Actual 0-100 km/h values are written to a separate sheet/file because
 %     they are validation targets, not simulation inputs.
 
-    fprintf("ams_json_to_DoE_Inp POWERTRAIN_FIELDMATCH_FIX_V6\n");
+    fprintf("ams_json_to_DoE_Inp POWERTRAIN_EV_FIX_V7\n");
 
     if nargin < 1 || strlength(safeStringScalar(inputFile)) == 0
         if isfile("webscraper_auto_motor_sport_marken_modelle.zip")
@@ -305,6 +305,14 @@ function row = convertRawToDoeRow(raw, emptyRow)
     row.Actual_0_to_100_s = raw.actual0100_s;
     row.Actual_max_speed_kmh = raw.vmax_kmh;
 
+    % Plausibility gate for known scraper mix-ups:
+    % A pure EV with a normal 7/8/9-speed automatic gearbox is very likely
+    % not a clean EV row (example: "S 450 ...", fuel="Elektro", gearbox="9-Gang").
+    % Porsche Taycan-like 2-speed EVs are still allowed.
+    if isEV && isfinite(raw.noGears) && raw.noGears >= 3
+        warnings(end+1) = "suspicious EV with multi-speed gearbox >=3"; %#ok<AGROW>
+    end
+
     row.m_curb = fallback(raw.mass_kg, 1500);
     if ~isfinite(raw.mass_kg), warnings(end+1) = "mass fallback"; end %#ok<AGROW>
     row.Wheelbase = fallback(raw.wheelbase_m, estimateWheelbase(raw.length_m, body));
@@ -327,6 +335,16 @@ function row = convertRawToDoeRow(raw, emptyRow)
     if row.iAG <= 0
         row.iAG = estimateFinalDrive(row.Powertrain, row.AWD);
         warnings(end+1) = "final drive estimated"; %#ok<AGROW>
+    end
+
+    % For pure EVs the model uses i_GET_EV as the total reduction.
+    % Therefore iAG must be 1.0, otherwise the model multiplies i_GET_EV*iAG
+    % and the EV becomes much too slow / speed-limited.
+    if isEV
+        if isfinite(row.iAG) && abs(row.iAG - 1.0) > 1e-6
+            warnings(end+1) = "EV final drive moved into i_GET_EV; iAG set to 1"; %#ok<AGROW>
+        end
+        row.iAG = 1.0;
     end
 
     row.mode = "performance";
@@ -448,16 +466,28 @@ function row = convertRawToDoeRow(raw, emptyRow)
     end
 
     if isEV
-        row.i_GET_EV = 9.0;
-        totalPwr = fallback(ePwr1, fallback(raw.system_kW, raw.power_kW));
-        totalTq = fallback(eTq1, fallback(raw.system_Nm, raw.torque_Nm));
-        if ~isfinite(totalPwr) || totalPwr <= 0
+        row.n_EV_max = 16000;
+        row.i_GET_EV = estimateEVTotalRatio(raw.vmax_kmh, row.d_wheel, row.n_EV_max);
+
+        % EV power fields in AMS can mean system power, motor power or boost
+        % power depending on the vehicle. For pure EVs use the largest
+        % positive power value as total system power, then split by motor count.
+        evPwrCandidates = [raw.system_kW, raw.power_kW, ePwr1, raw.ePower2_kW];
+        evPwrCandidates = evPwrCandidates(isfinite(evPwrCandidates) & evPwrCandidates > 0);
+        if isempty(evPwrCandidates)
             totalPwr = 120;
             warnings(end+1) = "EV power fallback"; %#ok<AGROW>
+        else
+            totalPwr = max(evPwrCandidates);
         end
-        if ~isfinite(totalTq) || totalTq <= 0
+
+        evTqCandidates = [raw.system_Nm, raw.torque_Nm, eTq1, raw.eTorque2_Nm];
+        evTqCandidates = evTqCandidates(isfinite(evTqCandidates) & evTqCandidates > 0);
+        if isempty(evTqCandidates)
             totalTq = estimateTorqueFromPower(totalPwr, 4500);
             warnings(end+1) = "EV torque estimated"; %#ok<AGROW>
+        else
+            totalTq = max(evTqCandidates);
         end
 
         nMot = max(1, round(fallback(raw.eMotorCount, 1)));
@@ -466,6 +496,15 @@ function row = convertRawToDoeRow(raw, emptyRow)
         end
         perMotorPwr = totalPwr / nMot;
         perMotorTq = totalTq / nMot;
+
+        % Plausibility floor: if AMS gives a very low motor torque while power
+        % is high, the acceleration becomes unrealistically slow. Approximate
+        % minimum constant-power base speed at 6000 rpm.
+        tqMinFromPower = estimateTorqueFromPower(perMotorPwr, 6000);
+        if isfinite(tqMinFromPower) && tqMinFromPower > 0 && perMotorTq < 0.75 * tqMinFromPower
+            perMotorTq = tqMinFromPower;
+            warnings(end+1) = "EV torque raised from power plausibility"; %#ok<AGROW>
+        end
 
         if row.AWD == 1 || contains(eLoc, "hinten") || nMot >= 2
             row.E2 = 1;
@@ -476,7 +515,7 @@ function row = convertRawToDoeRow(raw, emptyRow)
             row.Pwr_P4_max_kW = perMotorPwr;
             row.tq_P4_max = perMotorTq;
             row.n_P4_max = 16000;
-            row.i_ges_P4 = 9.0;
+            row.i_ges_P4 = row.i_GET_EV;
         else
             row.E0 = 1;
             row.Pwr_EV_max_kW = perMotorPwr;
@@ -563,6 +602,7 @@ function row = convertRawToDoeRow(raw, emptyRow)
     quality = quality - 5 * sum(contains(warnings, "estimated"));
     quality = quality - 8 * sum(contains(warnings, "fallback"));
     quality = quality - 10 * sum(contains(warnings, "repaired"));
+    quality = quality - 40 * sum(contains(warnings, "suspicious"));
     row.InputQualityScore = max(0, quality);
     row.InputWarnings = strjoin(warnings, " | ");
 end
@@ -576,7 +616,8 @@ function tf = isUsableDoeRow(row)
                (isfinite(row.Pwr_P4_max_kW) && row.Pwr_P4_max_kW > 0);
     hasWheelbase = isfinite(row.Wheelbase) && row.Wheelbase > 1.5;
     hasArea = isfinite(row.A_front) && row.A_front > 1.0;
-    tf = hasMass && hasPower && hasWheelbase && hasArea;
+    isSuspiciousEV = strcmpi(string(row.Powertrain), "EV") && contains(string(row.InputWarnings), "suspicious EV");
+    tf = hasMass && hasPower && hasWheelbase && hasArea && ~isSuspiciousEV;
 end
 
 %% ------------------------- DoE schema -------------------------
@@ -1099,6 +1140,20 @@ function y = fallback(x, defaultValue)
     else
         y = defaultValue;
     end
+end
+
+function r = estimateEVTotalRatio(vmax_kmh, d_wheel_m, nEVmax_rpm)
+    % Estimate EV total gear reduction from top speed if available.
+    % v[km/h] = n_motor[rpm] / i_total * pi*d[m] * 60 / 1000
+    if nargin < 3 || ~isfinite(nEVmax_rpm) || nEVmax_rpm <= 0
+        nEVmax_rpm = 16000;
+    end
+    if ~isfinite(vmax_kmh) || vmax_kmh <= 80 || ~isfinite(d_wheel_m) || d_wheel_m <= 0
+        r = 9.0;
+        return;
+    end
+    r = nEVmax_rpm * pi * d_wheel_m * 60 / (vmax_kmh * 1000);
+    r = min(max(r, 6.5), 13.5);
 end
 
 function wb = estimateWheelbase(length_m, body)

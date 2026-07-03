@@ -19,8 +19,10 @@ end
 % Prefer the full generated input. Fall back to a random test subset when used
 % inside an exported debug folder.
 
-default_doe             = 'DoE_Inp_random15.csv';
+default_doe = 'DoE_Inp_random15.csv';
+
 default_actualvalues    = 'DoE_Inp_ActualValues.xlsx';
+
 default_sim             = 'Simulation_Fahrmodell_v4_straight_line';
 
 % Get default chunk from table height
@@ -909,6 +911,11 @@ function [cfg, warnings, errors] = validateAndRepairInput(cfg, runID)
     isEV = pt == "EV" || pt == "BEV";
     isHybrid = pt == "HYBRID" || pt == "PHEV" || pt == "HEV";
 
+    rawGearboxTxt = lower(string(getTextField(cfg, 'Raw_Gearbox')));
+    if isEV && containsAnyMain(rawGearboxTxt, ["3-gang", "4-gang", "5-gang", "6-gang", "7-gang", "8-gang", "9-gang", "10-gang"])
+        errors(end+1) = "Suspicious EV input: multi-speed ICE gearbox text in Raw_Gearbox"; %#ok<AGROW>
+    end
+
     if isICE
         cfg.Powertrain = "ICE";
         cfg.VM = 1; cfg.EV = 0; cfg.Hy = 0;
@@ -939,9 +946,38 @@ function [cfg, warnings, errors] = validateAndRepairInput(cfg, runID)
         if cfg.Pwr_EV_max_kW <= 0 && oldPwr > 0, cfg.Pwr_EV_max_kW = oldPwr / nMot; end
         if cfg.tq_EV_max <= 0 && oldTq > 0, cfg.tq_EV_max = oldTq / nMot; end
         if cfg.n_EV_max <= 0, cfg.n_EV_max = oldN; end
+
+        % EV torque plausibility: low torque with high power makes EVs far too slow.
+        tqMinFromPower = estimateTorqueFromPowerMain(cfg.Pwr_EV_max_kW, 6000);
+        if isfinite(tqMinFromPower) && tqMinFromPower > 0 && cfg.tq_EV_max < 0.75 * tqMinFromPower
+            cfg.tq_EV_max = tqMinFromPower;
+            warnings(end+1) = "EV torque raised from power plausibility"; %#ok<AGROW>
+        end
+
         if cfg.Pwr_P4_max_kW <= 0 && (cfg.E2 || cfg.E3 || cfg.E4), cfg.Pwr_P4_max_kW = cfg.Pwr_EV_max_kW; end
         if cfg.tq_P4_max <= 0 && (cfg.E2 || cfg.E3 || cfg.E4), cfg.tq_P4_max = cfg.tq_EV_max; end
         if cfg.n_P4_max <= 0 && (cfg.E2 || cfg.E3 || cfg.E4), cfg.n_P4_max = cfg.n_EV_max; end
+
+        % For pure EVs, i_GET_EV is the total reduction. Do not also multiply
+        % by a final-drive iAG from an ICE/AMS gearbox field.
+        if abs(cfg.iAG - 1.0) > 1e-6
+            cfg.iAG = 1.0;
+            warnings(end+1) = "EV iAG set to 1 to avoid i_GET_EV*iAG double reduction"; %#ok<AGROW>
+        end
+        estEVRatio = estimateEVTotalRatioMain(cfg.Actual_max_speed_kmh, cfg.d_wheel, cfg.n_EV_max);
+        if isfinite(estEVRatio) && estEVRatio > 0
+            cfg.i_GET_EV = estEVRatio;
+            if cfg.E2 || cfg.E3 || cfg.E4
+                cfg.i_ges_P4 = estEVRatio;
+            end
+            warnings(end+1) = "EV i_GET_EV estimated from Actual_max_speed"; %#ok<AGROW>
+        else
+            cfg.i_GET_EV = min(max(cfg.i_GET_EV, 6.5), 13.5);
+            if cfg.E2 || cfg.E3 || cfg.E4
+                cfg.i_ges_P4 = cfg.i_GET_EV;
+            end
+        end
+
         cfg.P0 = 0; cfg.P2 = 0; cfg.P3 = 0; cfg.P4 = 0; cfg.P4_DM = 0;
     elseif isHybrid
         cfg.Powertrain = "Hybrid";
@@ -1153,6 +1189,26 @@ function txt = getTextField(s, fieldName)
         txt = string(s.(fieldName));
         if ismissing(txt), txt = ""; end
     end
+end
+
+function tq = estimateTorqueFromPowerMain(pwr_kW, rpm)
+    if ~isfinite(pwr_kW) || pwr_kW <= 0 || ~isfinite(rpm) || rpm <= 0
+        tq = NaN;
+    else
+        tq = 9550 * pwr_kW / rpm;
+    end
+end
+
+function r = estimateEVTotalRatioMain(vmax_kmh, d_wheel_m, nEVmax_rpm)
+    if nargin < 3 || ~isfinite(nEVmax_rpm) || nEVmax_rpm <= 0
+        nEVmax_rpm = 16000;
+    end
+    if ~isfinite(vmax_kmh) || vmax_kmh <= 80 || ~isfinite(d_wheel_m) || d_wheel_m <= 0
+        r = NaN;
+        return;
+    end
+    r = nEVmax_rpm * pi * d_wheel_m * 60 / (vmax_kmh * 1000);
+    r = min(max(r, 6.5), 13.5);
 end
 
 function x = normalizeSocFraction(x, defaultVal)
