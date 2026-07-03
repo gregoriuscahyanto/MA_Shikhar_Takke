@@ -318,6 +318,12 @@ for i = start_idx:end_idx
     cp.tq_ICE_idle = cfg.tq_ICE_idle;
     cp.tq_ICE_max = cfg.tq_ICE_max;
     cp.Pwr_ICE_max_kW = cfg.Pwr_ICE_max_kW;
+    cp.ICE_map_type = classifyICEMapTypeMain(cfg);
+    if cfg.VM == 1 || cfg.Hy == 1
+        fprintf('RunID %d: ICE map type = %s [Induction_Type="%s", Boost=%.3g bar]\n', ...
+            runID, char(string(cp.ICE_map_type)), char(string(getTextField(cfg, 'Induction_Type'))), getNumericField(cfg, 'Boost_Pressure_bar', 0));
+    end
+
     cp.n_P0_max = cfg.n_P0_max;
     cp.tq_P0_max = cfg.tq_P0_max;
     cp.Pwr_P0_max_kW = cfg.Pwr_P0_max_kW;
@@ -483,6 +489,7 @@ for i = start_idx:end_idx
 
     %% Result / diagnostics placeholder
     current_result = initRunResult(cfg, runID, inputWarnings);
+    current_result.ICE_map_type = string(cp.ICE_map_type);
     current_result.ShiftDelay_used = gb.shiftDelay;
     current_result.ShiftDelay_source = string(shiftSrc);
     current_result.Gearbox_type_resolved = string(gbType);
@@ -1398,6 +1405,69 @@ function txt = getTextField(s, fieldName)
     if isstruct(s) && isfield(s, fieldName) && ~isempty(s.(fieldName))
         txt = string(s.(fieldName));
         if ismissing(txt), txt = ""; end
+    end
+end
+
+function mapType = classifyICEMapTypeMain(cfg)
+    % Classify ICE map shape for ComponentParams.
+    % Output:
+    %   'turbo' -> early high-torque plateau, suited for turbo/supercharged ICE
+    %   'na'    -> delayed torque build-up, suited for naturally aspirated ICE
+
+    mapType = 'turbo';
+
+    induction = lower(strtrim(string(getTextField(cfg, 'Induction_Type'))));
+    boost = getNumericField(cfg, 'Boost_Pressure_bar', 0);
+
+    allTxt = lower(strjoin([ ...
+        string(getTextField(cfg, 'Induction_Type')), ...
+        string(getTextField(cfg, 'Raw_Fuel')), ...
+        string(getTextField(cfg, 'Raw_Power')), ...
+        string(getTextField(cfg, 'Raw_Gearbox')), ...
+        string(getTextField(cfg, 'Transmission_Type')), ...
+        string(getTextField(cfg, 'Vehicle_Name')), ...
+        string(getTextField(cfg, 'Powertrain'))], " "));
+
+    % Strong charged-engine hints. This is evaluated before NA hints because
+    % the current converter defaults Induction_Type to 'NA' for older CSVs.
+    hasTurboHint = boost > 0.05 || ...
+        containsAnyMain(allTxt, [ ...
+            "turbo", "turbocharged", "biturbo", "bi-turbo", "twin turbo", ...
+            "supercharged", "supercharger", "kompressor", ...
+            "tsi", "tfsi", "t-gdi", "tgdi", "gdi turbo", ...
+            "tdi", "cdi", "dci", "hdi", "jtd", "crdi", "bluehdi"]);
+
+    % Exact / robust NA hints. Avoid broad contains(...,'na') because that can
+    % accidentally match unrelated words.
+    hasNAHint = any(induction == ["na", "n/a", "naturally aspirated", "naturally_aspirated", ...
+                                  "saugmotor", "sauger", "aspirated"]) || ...
+        containsAnyMain(allTxt, ["naturally aspirated", "naturally-aspirated", "saugmotor", "sauger"]);
+
+    if hasTurboHint
+        mapType = 'turbo';
+        return;
+    end
+
+    if hasNAHint
+        mapType = 'na';
+        return;
+    end
+
+    % Fallback heuristic for unknown inputs:
+    % If the speed implied by Pmax/Tmax is relatively high, the engine behaves
+    % more like an NA engine. If torque is available very early relative to power,
+    % it behaves more like a turbo engine.
+    pwr_kW = getNumericField(cfg, 'Pwr_ICE_max_kW', 0);
+    tq_Nm  = getNumericField(cfg, 'tq_ICE_max', 0);
+    nMax   = getNumericField(cfg, 'n_ICE_max', 0);
+
+    if pwr_kW > 0 && tq_Nm > 0 && nMax > 0
+        nPowerAtMaxTorque = pwr_kW * 9549.3 / tq_Nm;
+        if nPowerAtMaxTorque > 0.55 * nMax
+            mapType = 'na';
+        else
+            mapType = 'turbo';
+        end
     end
 end
 
