@@ -19,7 +19,7 @@ function ams_json_to_DoE_Inp(inputFile, outBase)
 %   - Actual 0-100 km/h values are written to a separate sheet/file because
 %     they are validation targets, not simulation inputs.
 
-    fprintf("ams_json_to_DoE_Inp POWERTRAIN_EV_FIX_V8_CVT_EXCLUDED\n");
+    fprintf("ams_json_to_DoE_Inp POWERTRAIN_EV_FIX_V11_P0_POWER_AND_VALIDATION_FIX\n");
 
     if nargin < 1 || strlength(safeStringScalar(inputFile)) == 0
         if isfile("webscraper_auto_motor_sport_marken_modelle.zip")
@@ -85,6 +85,9 @@ function ams_json_to_DoE_Inp(inputFile, outBase)
             runID = runID + 1;
             row.RUN_ID = runID;
 
+            [actualP2W_kW_per_t, actual0100Valid, actual0100Warning] = ...
+                checkActual0100Plausibility(row, raw.actual0100_s);
+
             rows(end+1, 1) = row; %#ok<AGROW>
 
             meta = makeEmptyMetaRow();
@@ -110,6 +113,9 @@ function ams_json_to_DoE_Inp(inputFile, outBase)
             meta.Raw_Weight = raw.weightText;
             meta.Actual_0_to_100_s = raw.actual0100_s;
             meta.Actual_max_speed_kmh = raw.vmax_kmh;
+            meta.PowerToWeight_kW_per_t = actualP2W_kW_per_t;
+            meta.Valid_Actual_0_to_100 = actual0100Valid;
+            meta.Actual_0_to_100_Warning = actual0100Warning;
             metaRows(end+1, 1) = meta; %#ok<AGROW>
 
             if isfinite(raw.actual0100_s) || isfinite(raw.vmax_kmh)
@@ -119,6 +125,9 @@ function ams_json_to_DoE_Inp(inputFile, outBase)
                 a.Powertrain = row.Powertrain;
                 a.Actual_0_to_100_s = raw.actual0100_s;
                 a.Actual_max_speed_kmh = raw.vmax_kmh;
+                a.PowerToWeight_kW_per_t = actualP2W_kW_per_t;
+                a.Valid_Actual_0_to_100 = actual0100Valid;
+                a.Actual_0_to_100_Warning = actual0100Warning;
                 a.Source_URL = raw.techdataUrl;
                 actualRows(end+1, 1) = a; %#ok<AGROW>
             end
@@ -260,7 +269,7 @@ function row = convertRawToDoeRow(raw, emptyRow)
         safeStringScalar(raw.variantMeta)], " "));
     nameVariantTxt = safeLowerString(strjoin([safeStringScalar(raw.vehicleName), safeStringScalar(raw.variantMeta)], " "));
     has2WDNameHint = contains2WDHint(nameVariantTxt);
-    hasAWDNameHint = containsAny(nameVariantTxt, ["awd", "4wd", "4x4", "allrad"]);
+    hasAWDNameHint = containsAny(nameVariantTxt, ["awd", "4wd", "4x4", "allrad", "quattro", "xdrive", "4matic", "4matic+", "4motion", "e-four", "dual motor"]);
     hasCVTGearbox = isCvtGearboxText(raw.gearboxText);
 
     combustionFuelHint = containsAny(fuel, ["benzin", "diesel", "super", "normal", "autogas", "erdgas", "wasserstoff"]);
@@ -332,10 +341,16 @@ function row = convertRawToDoeRow(raw, emptyRow)
     row.A_front = estimateFrontalArea(raw.width_m, raw.height_m, body);
     row.h_s = estimateCgHeight(raw.height_m, body);
 
-    row.AWD = double(contains(drive, "allrad") || contains(drive, "4x4") || contains(drive, "awd"));
+    row.AWD = double(contains(drive, "allrad") || contains(drive, "4x4") || contains(drive, "awd") || ...
+        containsAny(drive, ["quattro", "xdrive", "4matic", "4motion", "e-four", "dual motor"]));
     row.HM_VA = double(contains(drive, "vorderrad") || contains(engineLoc, "vorn") || row.AWD == 1);
     if contains(drive, "hinterrad") && row.AWD == 0
         row.HM_VA = 0;
+    end
+    if hasAWDNameHint && ~has2WDNameHint && row.AWD == 0
+        row.AWD = 1;
+        row.HM_VA = 1;
+        warnings(end+1) = "AWD repaired from vehicle-name AWD/quattro/xDrive hint"; %#ok<AGROW>
     end
     if has2WDNameHint && ~hasAWDNameHint && row.AWD == 1
         row.AWD = 0;
@@ -345,6 +360,14 @@ function row = convertRawToDoeRow(raw, emptyRow)
             row.HM_VA = 1;
         end
         warnings(end+1) = "AWD repaired from vehicle-name 2WD/4x2 hint"; %#ok<AGROW>
+    end
+
+    if isEV && row.AWD == 0 && ~has2WDNameHint && ...
+            ((containsAny(eLoc, ["vorn", "vorne", "front"]) && containsAny(eLoc, ["hinten", "rear"])) || ...
+             containsAny(eLoc, ["allrad", "awd", "4x4", "dual motor"]))
+        row.AWD = 1;
+        row.HM_VA = 1;
+        warnings(end+1) = "EV AWD repaired from e-motor location hint"; %#ok<AGROW>
     end
 
     row.weight_dist = estimateWeightDist(row.AWD, row.HM_VA, drive, engineLoc, body, isEV);
@@ -492,7 +515,11 @@ function row = convertRawToDoeRow(raw, emptyRow)
         % EV power fields in AMS can mean system power, motor power or boost
         % power depending on the vehicle. For pure EVs use the largest
         % positive power value as total system power, then split by motor count.
-        evPwrCandidates = [raw.system_kW, raw.power_kW, ePwr1, raw.ePower2_kW];
+        evMotorPowerSum = NaN;
+        if isfinite(raw.ePower_kW) && raw.ePower_kW > 0 && isfinite(raw.ePower2_kW) && raw.ePower2_kW > 0
+            evMotorPowerSum = raw.ePower_kW + raw.ePower2_kW;
+        end
+        evPwrCandidates = [raw.system_kW, raw.power_kW, evMotorPowerSum, ePwr1, raw.ePower2_kW];
         evPwrCandidates = evPwrCandidates(isfinite(evPwrCandidates) & evPwrCandidates > 0);
         if has2WDNameHint && ~hasAWDNameHint && isfinite(raw.power_kW) && raw.power_kW > 0 && ...
                 isfinite(raw.system_kW) && raw.system_kW > 1.35 * raw.power_kW
@@ -505,7 +532,11 @@ function row = convertRawToDoeRow(raw, emptyRow)
             totalPwr = max(evPwrCandidates);
         end
 
-        evTqCandidates = [raw.system_Nm, raw.torque_Nm, eTq1, raw.eTorque2_Nm];
+        evMotorTorqueSum = NaN;
+        if isfinite(raw.eTorque_Nm) && raw.eTorque_Nm > 0 && isfinite(raw.eTorque2_Nm) && raw.eTorque2_Nm > 0
+            evMotorTorqueSum = raw.eTorque_Nm + raw.eTorque2_Nm;
+        end
+        evTqCandidates = [raw.system_Nm, raw.torque_Nm, evMotorTorqueSum, eTq1, raw.eTorque2_Nm];
         evTqCandidates = evTqCandidates(isfinite(evTqCandidates) & evTqCandidates > 0);
         if isempty(evTqCandidates)
             totalTq = estimateTorqueFromPower(totalPwr, 4500);
@@ -532,8 +563,24 @@ function row = convertRawToDoeRow(raw, emptyRow)
             warnings(end+1) = "EV torque raised from power plausibility"; %#ok<AGROW>
         end
 
-        if row.AWD == 1 || contains(eLoc, "hinten") || nMot >= 2
-            row.E2 = 1;
+        % Only AWD EVs are mapped to E2/E3/E4 and the secondary axle in
+        % this Simulink model. If AMS reports multiple motors but no AWD
+        % evidence, they are combined into one equivalent E0 machine on the
+        % driven axle. This avoids invalid rows like AWD=0 with E2/E4 and
+        % Pwr_P4_max_kW > 0.
+        isMultiMotorEV = row.AWD == 1 && ~(has2WDNameHint && ~hasAWDNameHint);
+        if ~isMultiMotorEV && nMot > 1
+            warnings(end+1) = "EV multi-motor but non-AWD mapped as equivalent E0; no secondary axle"; %#ok<AGROW>
+        end
+
+        if isMultiMotorEV
+            if nMot >= 4
+                row.E4 = 1;
+            elseif nMot == 3
+                row.E3 = 1;
+            else
+                row.E2 = 1;
+            end
             row.Pwr_EV_max_kW = perMotorPwr;
             row.tq_EV_max = perMotorTq;
             row.n_EV_max = 16000;
@@ -542,12 +589,32 @@ function row = convertRawToDoeRow(raw, emptyRow)
             row.tq_P4_max = perMotorTq;
             row.n_P4_max = 16000;
             row.i_ges_P4 = row.i_GET_EV;
+            evArch = 2;
+            if nMot == 3
+                evArch = 3;
+            elseif nMot >= 4
+                evArch = 4;
+            end
+            warnings(end+1) = sprintf("EV multi-motor mapped to E%d; P4 flag kept 0 for pure EV", evArch); %#ok<AGROW>
         else
+            % Single-motor EVs, including rear-wheel-drive vehicles with the
+            % motor located at the rear axle, must stay on E0. They must not
+            % get a synthetic P4/secondary-axle copy, otherwise the battery
+            % check and the Simulink input effectively see 2x EV power.
             row.E0 = 1;
-            row.Pwr_EV_max_kW = perMotorPwr;
-            row.tq_EV_max = perMotorTq;
+            row.Pwr_EV_max_kW = totalPwr;
+            row.tq_EV_max = totalTq;
             row.n_EV_max = 16000;
             row.Pwr_EV_nmax_red_perc = 0.04;
+            row.Pwr_P4_max_kW = 0;
+            row.tq_P4_max = 0;
+            row.n_P4_max = 0;
+            row.i_ges_P4 = 0;
+            if contains(eLoc, "hinten") && row.AWD == 0
+                row.HM_VA = 0;
+                row.weight_dist = estimateWeightDist(row.AWD, row.HM_VA, "hinterrad", engineLoc, body, true);
+                warnings(end+1) = "EV rear single motor mapped to E0 primary axle; no P4 duplication"; %#ok<AGROW>
+            end
         end
         % Pure EV must not be routed through hybrid P flags.
         row.P0 = 0; row.P2 = 0; row.P3 = 0; row.P4 = 0; row.P4_DM = 0;
@@ -570,6 +637,24 @@ function row = convertRawToDoeRow(raw, emptyRow)
         (containsAny(allTxt, ["mhev", "mild", "48v", "48 v", "mild-hybrid", "mildhybrid"]) || ...
          (isfinite(voltage) && voltage <= 80));
     if mildOnlyP0
+        % Some AMS mild-hybrid rows expose the 48V boost machine as
+        % "Leistung" and the actual combustion/system vehicle power as
+        % "Systemleistung". If we convert such P0-only vehicles to ICE
+        % without repairing Pwr_ICE_max_kW, they become unrealistically slow
+        % in the straight-line simulation.
+        pIceBeforeP0 = max(fallback(row.Pwr_ICE_max_kW, 0), 0);
+        if isfinite(raw.system_kW) && raw.system_kW > max(50, 2.5 * max(pIceBeforeP0, 1))
+            row.Pwr_ICE_max_kW = raw.system_kW;
+            row.tq_ICE_max = fallback(raw.system_Nm, fallback(raw.torque_Nm, estimateTorqueFromPower(row.Pwr_ICE_max_kW, raw.power_rpm)));
+            if ~isfinite(row.tq_ICE_max) || row.tq_ICE_max <= 0
+                row.tq_ICE_max = estimateTorqueFromPower(row.Pwr_ICE_max_kW, 5000);
+            end
+            row.tq_ICE_idle = 0.20 * row.tq_ICE_max;
+            warnings(end+1) = "P0-only mild hybrid ICE power repaired from system power"; %#ok<AGROW>
+        elseif pIceBeforeP0 <= 25 && ~isfinite(raw.system_kW)
+            warnings(end+1) = "P0-only mild hybrid has no system power; validation quality reduced"; %#ok<AGROW>
+        end
+
         row.Powertrain = "ICE";
         row.VM = 1; row.EV = 0; row.Hy = 0;
         row.P0 = 0; row.P2 = 0; row.P3 = 0; row.P4 = 0; row.P4_DM = 0;
@@ -749,6 +834,9 @@ function meta = makeEmptyMetaRow()
     meta.Raw_Weight = "";
     meta.Actual_0_to_100_s = NaN;
     meta.Actual_max_speed_kmh = NaN;
+    meta.PowerToWeight_kW_per_t = NaN;
+    meta.Valid_Actual_0_to_100 = false;
+    meta.Actual_0_to_100_Warning = "";
 end
 
 function a = makeEmptyActualRow()
@@ -758,6 +846,9 @@ function a = makeEmptyActualRow()
     a.Powertrain = "";
     a.Actual_0_to_100_s = NaN;
     a.Actual_max_speed_kmh = NaN;
+    a.PowerToWeight_kW_per_t = NaN;
+    a.Valid_Actual_0_to_100 = false;
+    a.Actual_0_to_100_Warning = "";
     a.Source_URL = "";
 end
 
@@ -1045,6 +1136,53 @@ function c = safeChar(v)
     c = char(safeStringScalar(v));
 end
 
+function x = parseLocalizedNumberToken(tok, allowThousands)
+    % Parses German/English numeric tokens robustly.
+    % Examples with allowThousands=true:
+    %   "1.103" -> 1103, "1,103" -> 1103, "1.103,5" -> 1103.5
+    % Examples with allowThousands=false:
+    %   "3.54" -> 3.54, "3,54" -> 3.54
+    if nargin < 2
+        allowThousands = true;
+    end
+
+    tok = safeChar(tok);
+    tok = strtrim(tok);
+    tok = regexprep(tok, '\s+', '');
+    if isempty(tok)
+        x = NaN;
+        return;
+    end
+
+    hasDot = ~isempty(strfind(tok, '.'));
+    hasComma = ~isempty(strfind(tok, ','));
+
+    if hasDot && hasComma
+        idxDot = find(tok == '.', 1, 'last');
+        idxComma = find(tok == ',', 1, 'last');
+        if idxComma > idxDot
+            % German style: 1.103,5
+            tok = strrep(tok, '.', '');
+            tok = strrep(tok, ',', '.');
+        else
+            % English style: 1,103.5
+            tok = strrep(tok, ',', '');
+        end
+    elseif hasComma
+        if allowThousands && ~isempty(regexp(tok, '^[+-]?\d{1,3}(,\d{3})+$', 'once'))
+            tok = strrep(tok, ',', '');
+        else
+            tok = strrep(tok, ',', '.');
+        end
+    elseif hasDot
+        if allowThousands && ~isempty(regexp(tok, '^[+-]?\d{1,3}(\.\d{3})+$', 'once'))
+            tok = strrep(tok, '.', '');
+        end
+    end
+
+    x = str2double(tok);
+end
+
 %% ------------------------- parsers -------------------------
 
 function x = parseFirstNumber(s)
@@ -1063,11 +1201,11 @@ function x = parseFirstNumber(s)
         return;
     end
 
-    tok = regexp(c, '[-+]?\d+(?:[\.,]\d+)?', 'match', 'once');
+    tok = regexp(c, '[-+]?\d+(?:[\.,]\d+)*', 'match', 'once');
     if isempty(tok)
         x = NaN;
     else
-        x = str2double(strrep(tok, ',', '.'));
+        x = parseLocalizedNumberToken(tok, true);
     end
 end
 
@@ -1079,22 +1217,21 @@ function x = parsePositiveNumber(s)
 end
 
 function v = parseSpeedKmh(s)
-    str = safeLowerString(s);
-    str = replace(str, ",", ".");
-    if strlength(str) == 0
-        v = NaN;
+    c = safeChar(s);
+    v = NaN;
+    if isempty(strtrim(c))
         return;
     end
-    toks = regexp(char(str), '([-+]?\d+(\.\d+)?)\s*km\s*/?\s*h', 'tokens');
+    toks = regexp(c, '([-+]?\d+(?:[\.,]\d+)*)\s*km\s*/?\s*h', 'tokens', 'ignorecase');
     if ~isempty(toks)
-        vals = cellfun(@(c) str2double(c{1}), toks);
+        vals = cellfun(@(cc) parseLocalizedNumberToken(cc{1}, true), toks);
         vals = vals(isfinite(vals) & vals > 20);
         if ~isempty(vals)
             v = vals(end);
             return;
         end
     end
-    v = parseFirstNumber(str);
+    v = parseFirstNumber(c);
     if ~isfinite(v) || v <= 20
         v = NaN;
     end
@@ -1106,14 +1243,14 @@ function p = parsePowerKW(s)
     if isempty(strtrim(c))
         return;
     end
-    tok = regexp(c, '(\d+(?:[\.,]\d+)?)\s*kW', 'tokens', 'once', 'ignorecase');
+    tok = regexp(c, '([-+]?\d+(?:[\.,]\d+)*)\s*kW', 'tokens', 'once', 'ignorecase');
     if ~isempty(tok)
-        p = str2double(strrep(tok{1}, ',', '.'));
+        p = parseLocalizedNumberToken(tok{1}, true);
         return;
     end
-    tok = regexp(c, '(\d+(?:[\.,]\d+)?)\s*PS', 'tokens', 'once', 'ignorecase');
+    tok = regexp(c, '([-+]?\d+(?:[\.,]\d+)*)\s*PS', 'tokens', 'once', 'ignorecase');
     if ~isempty(tok)
-        p = str2double(strrep(tok{1}, ',', '.')) * 0.735499;
+        p = parseLocalizedNumberToken(tok{1}, true) * 0.735499;
     end
 end
 
@@ -1123,9 +1260,9 @@ function tq = parseTorqueNm(s)
     if isempty(strtrim(c))
         return;
     end
-    tok = regexp(c, '(\d+(?:[\.,]\d+)?)\s*Nm', 'tokens', 'once', 'ignorecase');
+    tok = regexp(c, '([-+]?\d+(?:[\.,]\d+)*)\s*Nm', 'tokens', 'once', 'ignorecase');
     if ~isempty(tok)
-        tq = str2double(strrep(tok{1}, ',', '.'));
+        tq = parseLocalizedNumberToken(tok{1}, true);
     end
 end
 
@@ -1135,12 +1272,12 @@ function rpm = parseRpmAt(s)
     if isempty(strtrim(c))
         return;
     end
-    tok = regexp(c, 'bei\s*(\d+(?:[\.,]\d+)?)\s*U\s*/\s*min', 'tokens', 'once', 'ignorecase');
+    tok = regexp(c, 'bei\s*([-+]?\d+(?:[\.,]\d+)*)\s*U\s*/\s*min', 'tokens', 'once', 'ignorecase');
     if isempty(tok)
-        tok = regexp(c, '(\d+(?:[\.,]\d+)?)\s*U\s*/\s*min', 'tokens', 'once', 'ignorecase');
+        tok = regexp(c, '([-+]?\d+(?:[\.,]\d+)*)\s*U\s*/\s*min', 'tokens', 'once', 'ignorecase');
     end
     if ~isempty(tok)
-        rpm = str2double(strrep(tok{1}, ',', '.'));
+        rpm = parseLocalizedNumberToken(tok{1}, true);
     end
 end
 
@@ -1150,9 +1287,9 @@ function r = parseRatio(s)
     if isempty(strtrim(c))
         return;
     end
-    tok = regexp(c, '(\d+(?:[\.,]\d+)?)\s*:?\s*1?', 'tokens', 'once');
+    tok = regexp(c, '([-+]?\d+(?:[\.,]\d+)*)\s*:?\s*1?', 'tokens', 'once');
     if ~isempty(tok)
-        r = str2double(strrep(tok{1}, ',', '.'));
+        r = parseLocalizedNumberToken(tok{1}, false);
     end
 end
 
@@ -1165,9 +1302,9 @@ function gr = parseGearRatios(s)
     lines = regexp(c, '\r\n|\n|\r', 'split');
     for i = 1:numel(lines)
         line = strtrim(lines{i});
-        tok = regexp(line, '^(I|II|III|IV|V|VI|VII|VIII|IX|X)\.\s*(\d+(?:[\.,]\d+)?)', 'tokens', 'once', 'ignorecase');
+        tok = regexp(line, '^(I|II|III|IV|V|VI|VII|VIII|IX|X)\.\s*([-+]?\d+(?:[\.,]\d+)*)', 'tokens', 'once', 'ignorecase');
         if ~isempty(tok)
-            gr(end+1) = str2double(strrep(tok{2}, ',', '.')); %#ok<AGROW>
+            gr(end+1) = parseLocalizedNumberToken(tok{2}, false); %#ok<AGROW>
         end
     end
     gr = gr(isfinite(gr) & gr > 0);
@@ -1179,14 +1316,14 @@ function [L, W, H] = parseDimensions(s)
     if isempty(strtrim(c))
         return;
     end
-    tok = regexp(c, '(\d+(?:[\.,]\d+)?)\s*x\s*(\d+(?:[\.,]\d+)?)\s*x\s*(\d+(?:[\.,]\d+)?)\s*mm', 'tokens', 'once', 'ignorecase');
+    tok = regexp(c, '([-+]?\d+(?:[\.,]\d+)*)\s*x\s*([-+]?\d+(?:[\.,]\d+)*)\s*x\s*([-+]?\d+(?:[\.,]\d+)*)\s*mm', 'tokens', 'once', 'ignorecase');
     if isempty(tok)
-        tok = regexp(c, '(\d+(?:[\.,]\d+)?)\s*x\s*(\d+(?:[\.,]\d+)?)\s*x\s*(\d+(?:[\.,]\d+)?)', 'tokens', 'once', 'ignorecase');
+        tok = regexp(c, '([-+]?\d+(?:[\.,]\d+)*)\s*x\s*([-+]?\d+(?:[\.,]\d+)*)\s*x\s*([-+]?\d+(?:[\.,]\d+)*)', 'tokens', 'once', 'ignorecase');
     end
     if ~isempty(tok)
-        L = str2double(strrep(tok{1}, ',', '.')) / 1000;
-        W = str2double(strrep(tok{2}, ',', '.')) / 1000;
-        H = str2double(strrep(tok{3}, ',', '.')) / 1000;
+        L = parseLocalizedNumberToken(tok{1}, true) / 1000;
+        W = parseLocalizedNumberToken(tok{2}, true) / 1000;
+        H = parseLocalizedNumberToken(tok{3}, true) / 1000;
     end
 end
 
@@ -1207,9 +1344,9 @@ function P_kW = totalElectricPropulsionPowerConverter(row)
         end
         pEV = max(fallback(row.Pwr_EV_max_kW, 0), 0);
         pP4 = max(fallback(row.Pwr_P4_max_kW, 0), 0);
-        if pP4 <= 0
-            pP4 = pEV;
-        end
+        % Do not silently copy pEV to pP4. A rear single-motor EV uses E0 and
+        % Pwr_P4_max_kW = 0. Copying pEV here was the root cause for the
+        % apparent 2x battery power request in several RWD EV rows.
         P_kW = primaryMotors * pEV + secondaryMotors * pP4;
     else
         P_kW = max(fallback(row.Pwr_P0_max_kW, 0), 0) + ...
@@ -1219,6 +1356,129 @@ function P_kW = totalElectricPropulsionPowerConverter(row)
         if isfield(row, 'P4_DM') && row.P4_DM == 1
             P_kW = P_kW + max(fallback(row.Pwr_P4_max_kW, 0), 0);
         end
+    end
+end
+
+
+function P_kW = totalVehiclePowerForPlausibility(row)
+    P_kW = NaN;
+    if ~isstruct(row)
+        return;
+    end
+    if isfield(row, 'EV') && row.EV == 1 && isfield(row, 'Hy') && row.Hy == 0
+        P_kW = totalElectricPropulsionPowerConverter(row);
+        return;
+    end
+
+    pICE = max(fallback(row.Pwr_ICE_max_kW, 0), 0);
+    pEM  = totalElectricPropulsionPowerConverter(row);
+    if isfield(row, 'Hy') && row.Hy == 1
+        % Conservative validation power: ICE plus traction e-machine power.
+        % This is only used for flagging impossible actual 0-100 values, not
+        % as a simulation input.
+        P_kW = pICE + pEM;
+    else
+        P_kW = pICE;
+    end
+end
+
+function [p2w_kW_per_t, validActual, warningText] = checkActual0100Plausibility(row, t0100_s)
+    P_kW = totalVehiclePowerForPlausibility(row);
+    if isfinite(P_kW) && isfield(row, 'm_curb') && isfinite(row.m_curb) && row.m_curb > 0
+        p2w_kW_per_t = P_kW / row.m_curb * 1000;
+    else
+        p2w_kW_per_t = NaN;
+    end
+
+    validActual = true;
+    warningText = "";
+
+    if ~isfinite(t0100_s) || t0100_s <= 0
+        validActual = false;
+        warningText = "actual 0-100 missing";
+        return;
+    end
+
+    if t0100_s < 2.0 || t0100_s > 45.0
+        validActual = false;
+        warningText = "actual 0-100 outside physical validation range";
+        return;
+    end
+
+    warnStr = "";
+    if isfield(row, 'InputWarnings')
+        warnStr = string(row.InputWarnings);
+    end
+    if isfield(row, 'Powertrain') && strcmpi(string(row.Powertrain), "EV") && contains(warnStr, "EV power fallback")
+        validActual = false;
+        warningText = "actual 0-100 excluded: EV power fallback";
+        return;
+    end
+    if contains(warnStr, "mass fallback")
+        validActual = false;
+        warningText = "actual 0-100 excluded: mass fallback";
+        return;
+    end
+
+    if ~isfinite(p2w_kW_per_t)
+        warningText = "actual 0-100 not checked: power-to-weight unavailable";
+        return;
+    end
+
+    isLaunchCapable = false;
+    if isfield(row, 'AWD') && row.AWD == 1
+        isLaunchCapable = true;
+    end
+    if isfield(row, 'EV') && row.EV == 1
+        isLaunchCapable = true;
+    end
+
+    tooFast = false;
+    if isLaunchCapable
+        % AWD/EV/launch-control vehicles can achieve very short 0-100 times
+        % despite only moderate kW/t because the start is traction-limited.
+        if p2w_kW_per_t < 50 && t0100_s < 8.5
+            tooFast = true;
+        elseif p2w_kW_per_t < 75 && t0100_s < 6.8
+            tooFast = true;
+        elseif p2w_kW_per_t < 100 && t0100_s < 5.3
+            tooFast = true;
+        elseif p2w_kW_per_t < 150 && t0100_s < 4.0
+            tooFast = true;
+        elseif p2w_kW_per_t < 200 && t0100_s < 3.2
+            tooFast = true;
+        elseif p2w_kW_per_t < 300 && t0100_s < 2.4
+            tooFast = true;
+        end
+    else
+        if p2w_kW_per_t < 50 && t0100_s < 8.5
+            tooFast = true;
+        elseif p2w_kW_per_t < 75 && t0100_s < 6.8
+            tooFast = true;
+        elseif p2w_kW_per_t < 100 && t0100_s < 5.5
+            tooFast = true;
+        elseif p2w_kW_per_t < 150 && t0100_s < 4.3
+            tooFast = true;
+        elseif p2w_kW_per_t < 200 && t0100_s < 3.4
+            tooFast = true;
+        elseif p2w_kW_per_t < 300 && t0100_s < 2.5
+            tooFast = true;
+        end
+    end
+
+    tooSlow = false;
+    if p2w_kW_per_t > 250 && t0100_s > 12.0
+        tooSlow = true;
+    elseif p2w_kW_per_t > 150 && t0100_s > 18.0
+        tooSlow = true;
+    end
+
+    if tooFast
+        validActual = false;
+        warningText = sprintf("actual 0-100 implausibly fast for %.1f kW/t", p2w_kW_per_t);
+    elseif tooSlow
+        validActual = false;
+        warningText = sprintf("actual 0-100 implausibly slow for %.1f kW/t", p2w_kW_per_t);
     end
 end
 
