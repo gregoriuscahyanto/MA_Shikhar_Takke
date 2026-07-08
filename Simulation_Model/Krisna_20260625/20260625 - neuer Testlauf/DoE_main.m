@@ -19,7 +19,9 @@ end
 % Prefer the full generated input. Fall back to a random test subset when used
 % inside an exported debug folder.
 
-default_doe = 'DoE_Inp_random52.csv';
+% default_doe = 'DoE_Inp_random52.csv';
+% default_doe = 'DoE_Inp_nurLotusEletre.csv';
+default_doe = 'DoE_Inp_chosenHybrid2.csv';
 
 default_actualvalues    = 'DoE_Inp_ActualValues.xlsx';
 
@@ -319,6 +321,7 @@ for i = start_idx:end_idx
     cp.tq_ICE_max = cfg.tq_ICE_max;
     cp.Pwr_ICE_max_kW = cfg.Pwr_ICE_max_kW;
     cp.ICE_map_type = classifyICEMapTypeMain(cfg);
+    cp.ICE_fuel_type = char(string(getTextField(cfg, 'Raw_Fuel')));
     if cfg.VM == 1 || cfg.Hy == 1
         fprintf('RunID %d: ICE map type = %s [Induction_Type="%s", Boost=%.3g bar]\n', ...
             runID, char(string(cp.ICE_map_type)), char(string(getTextField(cfg, 'Induction_Type'))), getNumericField(cfg, 'Boost_Pressure_bar', 0));
@@ -347,7 +350,15 @@ for i = start_idx:end_idx
     if isfield(cfg, 'Pwr_EV_nmax_red_perc'), cp.Pwr_EV_nmax_red_perc = cfg.Pwr_EV_nmax_red_perc; else, cp.Pwr_EV_nmax_red_perc = 0.04; end
 
 
-    cp = cp.computeICEMap(cfg.VM, cfg.Hy); 
+    cp = cp.computeICEMap(cfg.VM, cfg.Hy);
+
+    % ComponentParams can repair n_ICE_max when the input value is only
+    % the nominal-power rpm. Keep cfg synchronized so gearbox/shift maps
+    % use the repaired redline as well.
+    if cfg.VM == 1 || cfg.Hy == 1
+        cfg.n_ICE_max = cp.n_ICE_max;
+    end
+
     if isfield(cfg, 'P0'), cp = cp.computeP0Map(cfg.P0); end
     if isfield(cfg, 'P2'), cp = cp.computeP2Map(cfg.P2); end
     if isfield(cfg, 'P3'), cp = cp.computeP3Map(cfg.P3); end
@@ -385,7 +396,11 @@ for i = start_idx:end_idx
     gb = GearboxConfig();
     gb.i_GET_EV = cfg.i_GET_EV;
     gb.i_ges_P4 = cfg.i_ges_P4;
-    gb.max_rpm = cfg.n_ICE_max;
+    if cfg.VM == 1 || cfg.Hy == 1
+        gb.max_rpm = cp.n_ICE_max;
+    else
+        gb.max_rpm = cfg.n_ICE_max;
+    end
     gb.mode = string(cfg.mode); 
     % gb.shiftDelay = cfg.shiftDelay; % nicht aus CSV übernehmen!
     gb.use_cus_val = logical(cfg.use_cus_val);
@@ -442,6 +457,21 @@ for i = start_idx:end_idx
             gb.shiftDelay, shiftSrc, gbType, p2w);
     end
 
+    % === EV 2-speed gearbox variables for Simulink ===
+    try
+        assignin('base', 'ev_2speed_enable', cfg.EV_2speed_enable);
+    
+        assignin('base', 'i_GET_EV_gear1', cfg.i_GET_EV_gear1);
+        assignin('base', 'i_GET_EV_gear2', cfg.i_GET_EV_gear2);
+    
+        assignin('base', 'i_ges_P4_gear1', cfg.i_ges_P4_gear1);
+        assignin('base', 'i_ges_P4_gear2', cfg.i_ges_P4_gear2);
+    
+        assignin('base', 'ev_shift_v_up_kmh', cfg.ev_shift_v_up_kmh);
+        assignin('base', 'ev_shift_v_down_kmh', cfg.ev_shift_v_down_kmh);
+    catch
+    end
+
     % --- Powertrain Config ---
     pt = PowertrainConfig();
     pt.VM = cfg.VM;
@@ -462,6 +492,23 @@ for i = start_idx:end_idx
 
     pt = pt.setupEV();
     pt = pt.setupHybrid();
+    
+    % === PATCH: cfg flags for EM Torque Distributor synchronisieren ===
+    try
+        if isprop(pt, 'cfg_P0'),    pt.cfg_P0    = double(cfg.P0);    end
+        if isprop(pt, 'cfg_P2'),    pt.cfg_P2    = double(cfg.P2);    end
+        if isprop(pt, 'cfg_P3'),    pt.cfg_P3    = double(cfg.P3);    end
+        if isprop(pt, 'cfg_P4'),    pt.cfg_P4    = double(cfg.P4);    end
+        if isprop(pt, 'cfg_P4_DM'), pt.cfg_P4_DM = double(cfg.P4_DM); end
+    
+        if isprop(pt, 'cfg_E0'),    pt.cfg_E0    = double(cfg.E0);    end
+        if isprop(pt, 'cfg_E1'),    pt.cfg_E1    = double(cfg.E1);    end
+        if isprop(pt, 'cfg_E2'),    pt.cfg_E2    = double(cfg.E2);    end
+        if isprop(pt, 'cfg_E3'),    pt.cfg_E3    = double(cfg.E3);    end
+        if isprop(pt, 'cfg_E4'),    pt.cfg_E4    = double(cfg.E4);    end
+    catch ME_pt_flags
+        warning('Could not synchronize pt.cfg_* flags: %s', ME_pt_flags.message);
+    end
 
     % --- Battery Config ---
     bat = BatteryConfig();
@@ -508,12 +555,32 @@ for i = start_idx:end_idx
     %% Result / diagnostics placeholder
     current_result = initRunResult(cfg, runID, inputWarnings);
     current_result.ICE_map_type = string(cp.ICE_map_type);
+    current_result.ICE_fuel_type = string(cp.ICE_fuel_type);
+    current_result.ICE_n_max_input = getPropOrDefault(cp, 'n_ICE_max_input', NaN);
+    current_result.ICE_n_max_repaired = getPropOrDefault(cp, 'n_ICE_max_repaired', NaN);
+    current_result.ICE_map_Pmax_initial_kW = getPropOrDefault(cp, 'ICE_map_Pmax_initial_kW', NaN);
+    current_result.ICE_map_Pmax_final_kW = getPropOrDefault(cp, 'ICE_map_Pmax_final_kW', NaN);
+    try
+        current_result.ICE_redline_repair_active = double(cp.ICE_redline_repair_active);
+    catch
+        current_result.ICE_redline_repair_active = NaN;
+    end
+    current_result.ICE_n_max_used_for_shift = gb.max_rpm;
     current_result.ShiftDelay_used = gb.shiftDelay;
     current_result.ShiftDelay_source = string(shiftSrc);
     current_result.Gearbox_type_resolved = string(gbType);
     current_result.Power_to_weight_kW_per_t = p2w;
     current_result.GearCount_used = gb.No_Gears;
     current_result.GearRatio_used = string(mat2str(gb.Gear_Ratio));
+
+    current_result.EV_2speed_enable = cfg.EV_2speed_enable;
+    current_result.i_GET_EV_gear1 = cfg.i_GET_EV_gear1;
+    current_result.i_GET_EV_gear2 = cfg.i_GET_EV_gear2;
+    current_result.i_ges_P4_gear1 = cfg.i_ges_P4_gear1;
+    current_result.i_ges_P4_gear2 = cfg.i_ges_P4_gear2;
+    current_result.ev_shift_v_up_kmh = cfg.ev_shift_v_up_kmh;
+    current_result.ev_shift_v_down_kmh = cfg.ev_shift_v_down_kmh;
+
     current_result.ElectricPower_req_kW_est = totalElectricPropulsionPowerMain(cfg);
     current_result.Battery_PackPower_dis_kW_est = estimatePackDischargePowerMain(cfg);
     current_result.Battery_Cell_I_max_dis_A_used = cfg.Cell_I_max_dis;
@@ -525,6 +592,17 @@ for i = start_idx:end_idx
     current_result.SKO_WHEEL_TYP_CHAL = SKO_WHEEL_TYP_CHAL;
     current_result.SKO_STREET_CHAL    = SKO_STREET_CHAL;
     current_result.cw_used            = cw;
+
+    current_result.pt_P0_after_setup    = getPropOrDefault(pt, 'P0', NaN);
+    current_result.pt_P2_after_setup    = getPropOrDefault(pt, 'P2', NaN);
+    current_result.pt_P3_after_setup    = getPropOrDefault(pt, 'P3', NaN);
+    current_result.pt_P4_after_setup    = getPropOrDefault(pt, 'P4', NaN);
+    current_result.pt_P4DM_after_setup  = getPropOrDefault(pt, 'P4_DM', NaN);
+    
+    current_result.pt_cfg_P0_after_setup = getPropOrDefault(pt, 'cfg_P0', NaN);
+    current_result.pt_cfg_P2_after_setup = getPropOrDefault(pt, 'cfg_P2', NaN);
+    current_result.pt_cfg_P3_after_setup = getPropOrDefault(pt, 'cfg_P3', NaN);
+    current_result.pt_cfg_P4_after_setup = getPropOrDefault(pt, 'cfg_P4', NaN);
 
     % Make actual Vmax/targets visible to optional Simulink stop/KPI blocks.
     vmaxLimit = getNumericField(cfg, 'Actual_max_speed_kmh', NaN);
@@ -575,10 +653,107 @@ for i = start_idx:end_idx
 
     % Extract SL. Missing variables are written as NaN, so this stays
     % compatible with the current SLX and with future diagnostic outputs.
+    % vars_SL = {'time_0_to_100', 'time_0_to_200', 'time_80_to_120', 'time_60_to_120', ...
+    %        'max_speed', 'max_speed_physical', 'max_speed_limited', ...
+    %        'max_launch_acc', 'v_final_kmh', 'v_max_kmh', ...
+    %        'stop_reason', 'Reached_100', 'Reached_200', 'Reached_80_120', 'Reached_60_120', ...
+    %        ...
+    %        'syslim_scale', 'syslim_scale_min', 'syslim_scale_max', ...
+    %        'syslim_Pwheel_kW', 'syslim_Pwheel_kW_max', 'syslim_r_wheel_m', ...
+    %        ...
+    %        'Tq_grip_FrontMax', 'Tq_grip_RearMax', ...
+    %        'Tq_FrontAxle', 'Tq_RearAxle', ...
+    %        'Tq_FrontAxle_max', 'Tq_RearAxle_max', ...
+    %        'M_VA_Nm_OUT', 'M_HA_Nm_OUT', ...
+    %        'M_VA_Nm_OUT_max', 'M_HA_Nm_OUT_max', ...
+    %        ...
+    %        'P_total_before_syslim_kW', 'P_total_before_syslim_kW_max', ...
+    %        'P_total_after_syslim_kW', 'P_total_after_syslim_kW_max', ...
+    %        ...
+    %        'P_ICE_motor_kW', 'P_ICE_motor_kW_max', ...
+    %        'P_P2_motor_kW', 'P_P2_motor_kW_max', ...
+    %        'P_EV_front_wheel_kW', 'P_EV_front_wheel_kW_max', ...
+    %        'P_EV_rear_wheel_kW', 'P_EV_rear_wheel_kW_max', ...
+    %        ...
+    %        'Battery_Discharge_Power_kW', 'Battery_Discharge_Power_kW_max', ...
+    %        'Battery_Pmax_discharge_kW', 'Battery_Pmax_charge_kW', 'Battery_SOC_pct', ...
+    %        'Battery_Limit_Scale', 'Battery_Limit_Scale_min', ...
+    %        ...
+    %        'n_EV_rpm', 'n_EV_rpm_max', ...
+    %        'n_P2_rpm', 'n_P2_rpm_max', ...
+    %        'n_P4_rpm', 'n_P4_rpm_max', ...
+    %        ...
+    %        'i_GET_EV_eff', 'i_GET_EV_eff_max', 'i_GET_EV_eff_min', ...
+    %        'i_ges_P4_eff', 'i_ges_P4_eff_max', 'i_ges_P4_eff_min', ...
+    %        'EV_gear', 'EV_gear_max', 'EV_gear2_active', ...
+    %        ...
+    %        'tq_wheel_EV_des', 'tq_wheel_EV_des_max', ...
+    %        'tq_sh_EV_des', 'tq_sh_EV_des_max', ...
+    %        'tq_wheel_P4_des_os', 'tq_wheel_P4_des_os_max', ...
+    %        'tq_sh_P4_des', 'tq_sh_P4_des_max', ...
+    %        ...
+    %        'tq_sh_EV_max', 'tq_sh_EV_max_max', ...
+    %        'tq_sh_EV_limited', 'tq_sh_EV_limited_max', ...
+    %        'tq_sh_EV_bat_limited', 'tq_sh_EV_bat_limited_max', ...
+    %        'tq_sh_EV_drive_selected', 'tq_sh_EV_drive_selected_max', ...
+    %        'tq_sh_EV_smoothed', 'tq_sh_EV_smoothed_max', ...
+    %        'M_EV_primary_before_eta_Nm', 'M_EV_primary_before_eta_Nm_max', ...
+    %        'M_EV_primary_out_Nm', 'M_EV_primary_out_Nm_max', ...
+    %        ...
+    %        'tq_sh_P4_max', 'tq_sh_P4_max_max', ...
+    %        'tq_sh_P4_limited', 'tq_sh_P4_limited_max', ...
+    %        'tq_sh_P4_bat_limited', 'tq_sh_P4_bat_limited_max', ...
+    %        'tq_sh_P4_drive_selected', 'tq_sh_P4_drive_selected_max', ...
+    %        'tq_sh_P4_smoothed', 'tq_sh_P4_smoothed_max', ...
+    %        'M_P4_secondary_out_Nm', 'M_P4_secondary_out_Nm_max', ...
+    %        ...
+    %        'tq_wheel_P4_max_os', 'tq_wheel_P4_max_os_max', ...
+    %        'tq_wheel_P4axle_des', 'tq_wheel_P4axle_des_max', ...
+    %        'tq_wheel_P4_des_split', 'tq_wheel_P4_des_split_max', ...
+    %        'tq_wheel_Primary_des_split', 'tq_wheel_Primary_des_split_max'};
+
     vars_SL = {'time_0_to_100', 'time_0_to_200', 'time_80_to_120', 'time_60_to_120', ...
-               'max_speed', 'max_speed_physical', 'max_speed_limited', ...
-               'max_launch_acc', 'v_final_kmh', 'v_max_kmh', ...
-               'stop_reason', 'Reached_100', 'Reached_200', 'Reached_80_120', 'Reached_60_120'};
+           'max_speed', 'max_speed_physical', 'max_speed_limited', ...
+           'max_launch_acc', 'v_final_kmh', 'v_max_kmh', ...
+           'stop_reason', 'Reached_100', 'Reached_200', 'Reached_80_120', 'Reached_60_120', ...
+           ...
+           'syslim_scale', 'syslim_scale_min', 'syslim_scale_max', ...
+           'syslim_Pwheel_kW', 'syslim_Pwheel_kW_max', 'syslim_r_wheel_m', ...
+           ...
+           'Tq_grip_FrontMax', 'Tq_grip_RearMax', ...
+           'Tq_FrontAxle', 'Tq_RearAxle', ...
+           'Tq_FrontAxle_max', 'Tq_RearAxle_max', ...
+           'M_VA_Nm_OUT', 'M_HA_Nm_OUT', ...
+           'M_VA_Nm_OUT_max', 'M_HA_Nm_OUT_max', ...
+           ...
+           'P_total_before_syslim_kW', 'P_total_before_syslim_kW_max', ...
+           'P_total_after_syslim_kW', 'P_total_after_syslim_kW_max', ...
+           ...
+           'P_ICE_motor_kW', 'P_ICE_motor_kW_max', ...
+           'P_P2_motor_kW', 'P_P2_motor_kW_max', ...
+           'P_EV_front_wheel_kW', 'P_EV_front_wheel_kW_max', ...
+           'P_EV_rear_wheel_kW', 'P_EV_rear_wheel_kW_max', ...
+           ...
+           'Battery_Discharge_Power_kW', 'Battery_Discharge_Power_kW_max', ...
+           'Battery_Pmax_discharge_kW', 'Battery_Pmax_charge_kW', 'Battery_SOC_pct', ...
+           'Battery_Limit_Scale', 'Battery_Limit_Scale_min', ...
+           ...
+           'n_EV_rpm', 'n_EV_rpm_max', ...
+           'n_P2_rpm', 'n_P2_rpm_max', ...
+           'n_P4_rpm', 'n_P4_rpm_max', ...
+           ...
+           'i_GET_EV_eff', 'i_GET_EV_eff_max', 'i_GET_EV_eff_min', ...
+           'i_ges_P4_eff', 'i_ges_P4_eff_max', 'i_ges_P4_eff_min', ...
+           'EV_gear', 'EV_gear_max', 'EV_gear2_active', ...
+           ...
+           'tq_wheel_Primary_axle_des', ... 
+           'tq_wheel_ICE_max', ...
+           'tq_wheel_Elec_des', ...
+           'tq_wheel_P2_des', ...
+           'tq_sh_P2_des', ...
+           ...
+           'P_sum_motors_kW'};
+
     current_result = extractVars(simOut_SL, vars_SL, current_result, 'SL_');
     current_result = sanitizeStraightLineKpis(current_result);
 
@@ -767,32 +942,108 @@ function v = parseNumericVector(x)
 end
 
 function current_result = extractVars(simOut, varNames, current_result, prefix)
-    % (Same as before)
+    % Extract scalar diagnostics from simOut.
+    % Normal variables are saved as the last finite sample.
+    % If '<signal>_max' or '<signal>_min' is requested but that variable does
+    % not exist in simOut, this function derives it automatically from
+    % '<signal>'. This avoids adding separate Max/Min blocks for every new
+    % To Workspace signal in Simulink.
     if isempty(simOut)
         for k = 1:length(varNames)
             current_result.([prefix, varNames{k}]) = NaN;
         end
         return;
     end
+
     available = simOut.who;
     for k = 1:length(varNames)
-        rawName = varNames{k};
+        rawName = char(string(varNames{k}));
         saveName = [prefix, rawName];
-        if ismember(rawName, available)
-            dataObj = simOut.get(rawName);
-            if isa(dataObj, 'timeseries')
-                val = dataObj.Data(end);
-            elseif isa(dataObj, 'struct') && isfield(dataObj, 'signals')
-                val = dataObj.signals.values(end);
-            elseif isnumeric(dataObj)
-                val = dataObj(end);
-            else
-                val = NaN;
-            end
-            current_result.(saveName) = val;
-        else
-            current_result.(saveName) = NaN;
+        [val, found] = extractSimOutValue(simOut, rawName, available);
+        if ~found
+            val = NaN;
         end
+        current_result.(saveName) = val;
+    end
+end
+
+function [val, found] = extractSimOutValue(simOut, rawName, available)
+    val = NaN;
+    found = false;
+
+    % Direct variable exists: use final finite value. For running max/min
+    % blocks this final value is already the desired max/min.
+    if ismember(rawName, available)
+        dataObj = simOut.get(rawName);
+        val = lastFiniteScalar(dataObj);
+        found = true;
+        return;
+    end
+
+    rawStr = string(rawName);
+
+    % Derived maximum: request '<base>_max', but only '<base>' exists.
+    if endsWith(rawStr, "_max")
+        baseName = char(extractBefore(rawStr, strlength(rawStr) - strlength("_max") + 1));
+        if ismember(baseName, available)
+            dataObj = simOut.get(baseName);
+            val = finiteStatisticScalar(dataObj, "max");
+            found = true;
+            return;
+        end
+    end
+
+    % Derived minimum: request '<base>_min', but only '<base>' exists.
+    if endsWith(rawStr, "_min")
+        baseName = char(extractBefore(rawStr, strlength(rawStr) - strlength("_min") + 1));
+        if ismember(baseName, available)
+            dataObj = simOut.get(baseName);
+            val = finiteStatisticScalar(dataObj, "min");
+            found = true;
+            return;
+        end
+    end
+end
+
+function val = lastFiniteScalar(dataObj)
+    vals = simDataToNumericVector(dataObj);
+    vals = vals(isfinite(vals));
+    if isempty(vals)
+        val = NaN;
+    else
+        val = vals(end);
+    end
+end
+
+function val = finiteStatisticScalar(dataObj, mode)
+    vals = simDataToNumericVector(dataObj);
+    vals = vals(isfinite(vals));
+    if isempty(vals)
+        val = NaN;
+    elseif mode == "max"
+        val = max(vals);
+    elseif mode == "min"
+        val = min(vals);
+    else
+        val = vals(end);
+    end
+end
+
+function vals = simDataToNumericVector(dataObj)
+    vals = [];
+    try
+        if isa(dataObj, 'timeseries')
+            vals = dataObj.Data;
+        elseif isa(dataObj, 'struct') && isfield(dataObj, 'signals')
+            vals = dataObj.signals.values;
+        elseif isnumeric(dataObj) || islogical(dataObj)
+            vals = dataObj;
+        else
+            vals = [];
+        end
+        vals = double(vals(:));
+    catch
+        vals = [];
     end
 end
 
@@ -954,7 +1205,12 @@ function [cfg, warnings, errors] = validateAndRepairInput(cfg, runID)
         'm_curb', 1500; 'Wheelbase', 2.65; 'h_s', 0.45; 'weight_dist', 1.20; ...
         'MainAxle_TorqueSplit_int', 0.5; 'Hybrid_ICE_priority', 1; ...
         'VM', 1; 'EV', 0; 'Hy', 0; 'E0', 0; 'E1', 0; 'E2', 0; 'E3', 0; 'E4', 0; ...
-        'i_GET_EV', 9.0; 'i_ges_P4', 9.0; 'use_cus_val', 1; 'No_Gears', 0; 'shiftDelay', NaN; ...
+        'i_GET_EV', 9.0; 'i_ges_P4', 9.0; ...
+        'EV_2speed_enable', 0; ...
+        'i_GET_EV_gear1', 9.0; 'i_GET_EV_gear2', 9.0; ...
+        'i_ges_P4_gear1', 9.0; 'i_ges_P4_gear2', 9.0; ...
+        'ev_shift_v_up_kmh', 1e6; 'ev_shift_v_down_kmh', 1e6; ...
+        'use_cus_val', 1; 'No_Gears', 0; 'shiftDelay', NaN; ...
         'Displacement_cc', 0; 'Boost_Pressure_bar', 0; ...
         'P0', 0; 'P2', 0; 'P3', 0; 'P4', 0; 'P4_DM', 0; ...
         'n_ICE_idle', 0; 'n_ICE_max', 0; 'tq_ICE_idle', 0; 'tq_ICE_max', 0; 'Pwr_ICE_max_kW', 0; ...
@@ -1091,6 +1347,62 @@ function [cfg, warnings, errors] = validateAndRepairInput(cfg, runID)
             if cfg.E2 || cfg.E3 || cfg.E4
                 cfg.i_ges_P4 = cfg.i_GET_EV;
             end
+        end
+
+        % === EV 2-speed gearbox support ===
+        rawGearboxTxt2 = lower(string(getTextField(cfg, 'Raw_Gearbox')) + " " + ...
+                               string(getTextField(cfg, 'Transmission_Type')));
+        
+        isTwoSpeedEV = containsAnyMain(rawGearboxTxt2, ...
+            ["2-gang", "2 gang", "2-gang-automatik", "2 gang automatik", ...
+             "2-speed", "two-speed", "two speed", "zweigang", "zwei-gang"]);
+        
+        cfg.EV_2speed_enable = double(isTwoSpeedEV);
+        
+        % Default: single-speed behaviour
+        cfg.i_GET_EV_gear1 = cfg.i_GET_EV;
+        cfg.i_GET_EV_gear2 = cfg.i_GET_EV;
+        cfg.i_ges_P4_gear1 = cfg.i_ges_P4;
+        cfg.i_ges_P4_gear2 = cfg.i_ges_P4;
+        cfg.ev_shift_v_up_kmh = 1e6;
+        cfg.ev_shift_v_down_kmh = 1e6;
+        
+        if isTwoSpeedEV
+            % Long gear is the Vmax gear.
+            cfg.i_GET_EV_gear2 = cfg.i_GET_EV;
+            cfg.i_ges_P4_gear2 = cfg.i_ges_P4;
+        
+            % Gear spread: first gear shorter than second gear.
+            % Lotus needs about 1.5-1.6x; keep it generic and limited.
+            EV_2speed_ratio_spread = 1.55;
+        
+            i1_primary_raw = EV_2speed_ratio_spread * cfg.i_GET_EV_gear2;
+            i1_p4_raw      = EV_2speed_ratio_spread * cfg.i_ges_P4_gear2;
+        
+            % Do not make 1st gear so short that it must shift before 100 km/h.
+            % Use 92% nmax as practical upshift speed.
+            n_shift_up_rpm = 0.92 * max(cfg.n_EV_max, 16000);
+        
+            if isfinite(cfg.d_wheel) && cfg.d_wheel > 0
+                i1_max_at_105 = n_shift_up_rpm * pi * cfg.d_wheel * 60 / (105 * 1000);
+            else
+                i1_max_at_105 = 20;
+            end
+        
+            % Keep ratios in a physically plausible range.
+            cfg.i_GET_EV_gear1 = min(max(i1_primary_raw, cfg.i_GET_EV_gear2), i1_max_at_105);
+            cfg.i_ges_P4_gear1 = min(max(i1_p4_raw,      cfg.i_ges_P4_gear2), i1_max_at_105);
+        
+            % Shift speed derived from motor speed in 1st gear.
+            cfg.ev_shift_v_up_kmh = n_shift_up_rpm * pi * cfg.d_wheel * 60 / ...
+                                    (cfg.i_GET_EV_gear1 * 1000);
+        
+            % Hysteresis to avoid gear chatter.
+            cfg.ev_shift_v_down_kmh = max(20, cfg.ev_shift_v_up_kmh - 15);
+        
+            warnings(end+1) = sprintf( ...
+                "EV 2-speed gearbox active: i1=%.2f, i2=%.2f, shift_up=%.1f km/h", ...
+                cfg.i_GET_EV_gear1, cfg.i_GET_EV_gear2, cfg.ev_shift_v_up_kmh);
         end
 
         cfg.P0 = 0; cfg.P2 = 0; cfg.P3 = 0; cfg.P4 = 0; cfg.P4_DM = 0;
@@ -1305,10 +1617,24 @@ function [delay, source, gbType, p2w] = resolveShiftDelay(cfg)
     end
     if containsAnyMain(gbText, ["doppelkuppl", "dsg", "pdk", "s tronic", "m dct"])
         gbType = "dct";
-        if isfinite(p2w) && p2w > 250, delay = 0.10; else, delay = 0.18; end
+        if isfinite(p2w) && p2w > 100
+            delay = 0.12;
+        else
+            delay = 0.18;
+        end
         source = "gearbox_text";
     elseif containsAnyMain(gbText, ["automatik", "wandler", "tiptronic", "steptronic", "zf"])
-        gbType = "automatic"; delay = 0.35; source = "gearbox_text";
+        gbType = "automatic";
+
+        if isfinite(p2w) && p2w > 100
+            delay = 0.22;
+        elseif isfinite(p2w) && p2w > 70
+            delay = 0.28;
+        else
+            delay = 0.35;
+        end
+    
+        source = "gearbox_text";
     elseif containsAnyMain(gbText, ["schalt", "manuell"])
         gbType = "manual"; delay = 0.80; source = "gearbox_text";
     else

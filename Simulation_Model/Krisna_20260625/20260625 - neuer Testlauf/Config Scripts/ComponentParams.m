@@ -31,6 +31,17 @@ classdef ComponentParams
         torque_values_ICE       double = [];
         n_ICE_plateau_start     double = NaN;
         n_ICE_plateau_end       double = NaN;
+
+        % Diagnostics for automatic ICE redline repair.
+        % n_ICE_max is used by the vehicle model as redline / shift rpm.
+        % Some input rows contain the nominal-power rpm instead. If the
+        % generated map cannot reach Pwr_ICE_max_kW, computeICEMap raises
+        % n_ICE_max and recomputes the map within plausible bounds.
+        n_ICE_max_input             double = NaN;
+        n_ICE_max_repaired          double = NaN;
+        ICE_map_Pmax_initial_kW     double = NaN;
+        ICE_map_Pmax_final_kW       double = NaN;
+        ICE_redline_repair_active   logical = false;
     end
 
     %% ---- P0 user parameters ----
@@ -100,6 +111,13 @@ classdef ComponentParams
             P_max_kW = obj.Pwr_ICE_max_kW;
             n_max    = obj.n_ICE_max;
 
+            % Reset diagnostics for this map calculation.
+            obj.n_ICE_max_input           = n_max;
+            obj.n_ICE_max_repaired        = n_max;
+            obj.ICE_map_Pmax_initial_kW   = NaN;
+            obj.ICE_map_Pmax_final_kW     = NaN;
+            obj.ICE_redline_repair_active = false;
+
             % Defensive checks keep old/partial DoE rows from creating invalid maps.
             if ~isfinite(n_idle) || ~isfinite(n_max) || ~isfinite(M_max) || ~isfinite(P_max_kW) || ...
                     n_idle <= 0 || n_max <= n_idle || M_max <= 0 || P_max_kW <= 0
@@ -110,9 +128,83 @@ classdef ComponentParams
                 return;
             end
 
-            speed_vec = linspace(n_idle, n_max, 500);
             mapType = lower(strtrim(string(obj.ICE_map_type)));
 
+            % First calculation with the input n_ICE_max.
+            speed_vec = linspace(n_idle, n_max, 500);
+            [torque_vec, n_marker_1, n_marker_2] = obj.computeSelectedICEMap( ...
+                speed_vec, n_idle, M_idle, M_max, P_max_kW, n_max, mapType);
+
+            P_map_max = obj.getMapMaxPower_kW(speed_vec, torque_vec);
+            obj.ICE_map_Pmax_initial_kW = P_map_max;
+
+            % If the map cannot reach nominal power, n_ICE_max is probably
+            % a nominal-power rpm instead of the real redline. Raise it and
+            % recompute until the map reaches nominal power or a plausible
+            % type-specific rpm cap is reached.
+            if isfinite(P_map_max) && P_map_max < 0.98 * P_max_kW
+                [rpmFloor, rpmCap] = obj.getICERedlineRepairBounds(mapType);
+                n_req_from_torque = (P_max_kW * obj.CONV_CONST) / max(M_max, 1);
+
+                n_candidate = max([n_max, rpmFloor, 1.08 * n_req_from_torque]);
+                n_candidate = min(n_candidate, rpmCap);
+
+                n_try = n_candidate;
+                for it = 1:8
+                    speed_try = linspace(n_idle, n_try, 500);
+                    [torque_try, n_m1_try, n_m2_try] = obj.computeSelectedICEMap( ...
+                        speed_try, n_idle, M_idle, M_max, P_max_kW, n_try, mapType);
+
+                    P_try = obj.getMapMaxPower_kW(speed_try, torque_try);
+                    if isfinite(P_try) && P_try >= 0.98 * P_max_kW
+                        speed_vec = speed_try;
+                        torque_vec = torque_try;
+                        n_marker_1 = n_m1_try;
+                        n_marker_2 = n_m2_try;
+                        n_max = n_try;
+                        P_map_max = P_try;
+                        break;
+                    end
+
+                    % Keep best available try even if the cap is reached.
+                    if isfinite(P_try) && (~isfinite(P_map_max) || P_try > P_map_max)
+                        speed_vec = speed_try;
+                        torque_vec = torque_try;
+                        n_marker_1 = n_m1_try;
+                        n_marker_2 = n_m2_try;
+                        n_max = n_try;
+                        P_map_max = P_try;
+                    end
+
+                    if n_try >= rpmCap - 1
+                        break;
+                    end
+                    n_try = min(rpmCap, max(n_try + 300, 1.07 * n_try));
+                end
+            end
+
+            % Final safety: if plausible redline repair alone was not enough,
+            % raise the high-rpm part of the shaped map up to the nominal-power
+            % envelope at one physically feasible operating region. This keeps
+            % Pwr_ICE_max_kW as an actually reachable nominal power, not only
+            % as a ceiling.
+            if isfinite(P_map_max) && P_map_max < 0.98 * P_max_kW
+                [torque_vec, P_map_max] = obj.enforceNominalPowerSupport( ...
+                    speed_vec, torque_vec, M_max, P_max_kW, n_max, mapType);
+            end
+
+            obj.n_ICE_max = n_max;
+            obj.n_ICE_max_repaired = n_max;
+            obj.ICE_map_Pmax_final_kW = P_map_max;
+            obj.ICE_redline_repair_active = abs(obj.n_ICE_max_repaired - obj.n_ICE_max_input) > 1;
+
+            obj.n_ICE_plateau_start = n_marker_1;
+            obj.n_ICE_plateau_end   = n_marker_2;
+            obj.speed_breakpoints_ICE = speed_vec;
+            obj.torque_values_ICE     = torque_vec;
+        end
+
+        function [torque_vec, n_marker_1, n_marker_2] = computeSelectedICEMap(obj, speed_vec, n_idle, M_idle, M_max, P_max_kW, n_max, mapType)
             if any(mapType == ["diesel_turbo", "turbo_diesel", "diesel"])
                 [torque_vec, n_marker_1, n_marker_2] = obj.computeDieselTurboICEMap( ...
                     speed_vec, n_idle, M_idle, M_max, P_max_kW, n_max);
@@ -136,11 +228,6 @@ classdef ComponentParams
                 [torque_vec, n_marker_1, n_marker_2] = obj.computeTurboPetrolICEMap( ...
                     speed_vec, n_idle, M_idle, M_max, P_max_kW, n_max);
             end
-
-            obj.n_ICE_plateau_start = n_marker_1;
-            obj.n_ICE_plateau_end   = n_marker_2;
-            obj.speed_breakpoints_ICE = speed_vec;
-            obj.torque_values_ICE     = torque_vec;
         end
 
         %% ===== More specific ICE map families =====
@@ -239,6 +326,120 @@ classdef ComponentParams
             [~, idxMax] = max(tq_bp);
             n_marker_1 = n_bp(max(1, idxMax));
             n_marker_2 = n_bp(min(numel(n_bp), max(idxMax + 1, idxMax)));
+        end
+
+        function Pmax_kW = getMapMaxPower_kW(obj, rpm_vec, tq_vec) %#ok<INUSL>
+            Pmax_kW = NaN;
+            try
+                rpm_vec = double(rpm_vec(:));
+                tq_vec  = double(tq_vec(:));
+                n = min(numel(rpm_vec), numel(tq_vec));
+                if n < 1
+                    return;
+                end
+                P_kW = rpm_vec(1:n) .* tq_vec(1:n) ./ obj.CONV_CONST;
+                Pmax_kW = max(P_kW);
+            catch
+                Pmax_kW = NaN;
+            end
+        end
+
+        function [torque_vec, Pmax_kW] = enforceNominalPowerSupport(obj, rpm_vec, torque_vec, M_max, P_max_kW, n_max, mapType)
+            % If the shape is too conservative, make nominal power reachable
+            % in a narrow high-rpm band while respecting both max torque and
+            % the max-power envelope.
+            Pmax_kW = obj.getMapMaxPower_kW(rpm_vec, torque_vec);
+
+            if ~isfinite(P_max_kW) || ~isfinite(M_max) || ~isfinite(n_max) || ...
+                    P_max_kW <= 0 || M_max <= 0 || n_max <= 0
+                return;
+            end
+
+            n_req = (P_max_kW * obj.CONV_CONST) / M_max;
+            if ~isfinite(n_req) || n_req >= 0.98 * n_max
+                return;
+            end
+
+            rpm_vec = double(rpm_vec(:)).';
+            torque_vec = double(torque_vec(:)).';
+
+            powerFrac = obj.getNominalPowerRpmFraction(mapType);
+            n_target = max(1.03 * n_req, powerFrac * n_max);
+            n_target = min(n_target, 0.96 * n_max);
+
+            if n_target <= n_req
+                n_target = min(0.96 * n_max, 1.03 * n_req);
+            end
+
+            bandWidth = max(250, 0.075 * n_max);
+            band = abs(rpm_vec - n_target) <= bandWidth & rpm_vec >= n_req & rpm_vec <= n_max;
+
+            if ~any(band)
+                [~, idxNearest] = min(abs(rpm_vec - n_target));
+                band(idxNearest) = true;
+            end
+
+            targetTorque = (P_max_kW * obj.CONV_CONST) ./ max(rpm_vec, 1);
+            torque_vec(band) = max(torque_vec(band), targetTorque(band));
+
+            torque_vec = min(torque_vec, M_max);
+            torque_vec = min(torque_vec, targetTorque);
+            torque_vec = max(torque_vec, 0);
+
+            Pmax_kW = obj.getMapMaxPower_kW(rpm_vec, torque_vec);
+        end
+
+        function powerFrac = getNominalPowerRpmFraction(obj, mapType) %#ok<INUSL>
+            typeTxt = lower(strtrim(string(mapType)));
+
+            if contains(typeTxt, "diesel")
+                powerFrac = 0.82;
+            elseif contains(typeTxt, "high_rpm") || contains(typeTxt, "highrev") || contains(typeTxt, "high_rev")
+                powerFrac = 0.90;
+            elseif contains(typeTxt, "small_na") || contains(typeTxt, "large_na") || contains(typeTxt, "naturally") || contains(typeTxt, "saugmotor")
+                powerFrac = 0.86;
+            elseif contains(typeTxt, "performance") || contains(typeTxt, "sport_turbo")
+                powerFrac = 0.82;
+            else
+                % Normal turbo petrol / petrol hybrid.
+                powerFrac = 0.80;
+            end
+        end
+
+        function [rpmFloor, rpmCap] = getICERedlineRepairBounds(obj, mapType)
+            % Bounds are intentionally conservative. They only define where
+            % automatic redline repair may search if the map cannot reach
+            % nominal power.
+            fuelTxt = lower(strtrim(string(obj.ICE_fuel_type)));
+            typeTxt = lower(strtrim(string(mapType)));
+            allTxt = fuelTxt + " " + typeTxt;
+
+            isDiesel = contains(allTxt, "diesel") || contains(allTxt, "tdi") || ...
+                       contains(allTxt, "cdi") || contains(allTxt, "dci") || ...
+                       contains(allTxt, "hdi") || contains(allTxt, "crdi");
+            isHighRpmNA = contains(allTxt, "high_rpm") || contains(allTxt, "highrev") || ...
+                          contains(allTxt, "high_rev");
+            isNA = contains(allTxt, "_na") || contains(allTxt, " na") || ...
+                   contains(allTxt, "naturally") || contains(allTxt, "saugmotor");
+            isPerformanceTurbo = contains(allTxt, "performance") || contains(allTxt, "sport_turbo");
+
+            if isDiesel
+                rpmFloor = 4800;
+                rpmCap   = 5600;
+            elseif isHighRpmNA
+                rpmFloor = 7000;
+                rpmCap   = 9000;
+            elseif isNA
+                rpmFloor = 6500;
+                rpmCap   = 8000;
+            elseif isPerformanceTurbo
+                rpmFloor = 6500;
+                rpmCap   = 7800;
+            else
+                % Normal turbo petrol / petrol hybrid fallback.
+                rpmFloor = 6500;
+                rpmCap   = 7500;
+            end
         end
 
         %% ===== Backward-compatible wrappers =====
