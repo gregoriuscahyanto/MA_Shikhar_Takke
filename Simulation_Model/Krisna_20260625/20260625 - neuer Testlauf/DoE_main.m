@@ -522,6 +522,9 @@ for i = start_idx:end_idx
     current_result.SimStatus = "SETUP_OK";
     current_result.SystemPowerLimit_enable = system_power_limit_enable;
     current_result.SystemPowerLimit_kW = Pwr_system_limit_kW;
+    current_result.SKO_WHEEL_TYP_CHAL = SKO_WHEEL_TYP_CHAL;
+    current_result.SKO_STREET_CHAL    = SKO_STREET_CHAL;
+    current_result.cw_used            = cw;
 
     % Make actual Vmax/targets visible to optional Simulink stop/KPI blocks.
     vmaxLimit = getNumericField(cfg, 'Actual_max_speed_kmh', NaN);
