@@ -19,7 +19,7 @@ end
 % Prefer the full generated input. Fall back to a random test subset when used
 % inside an exported debug folder.
 
-default_doe = 'DoE_Inp_random15.csv';
+default_doe = 'DoE_Inp_random52.csv';
 
 default_actualvalues    = 'DoE_Inp_ActualValues.xlsx';
 
@@ -487,6 +487,24 @@ for i = start_idx:end_idx
     % Simulink reads SKO_WHEEL_TYP_CHAL, cw, A_front directly from base workspace.
     veh.cw      = cw;
 
+    %% === HYBRID SYSTEM POWER LIMIT FOR SIMULINK ===
+    % DoE_main only provides the parameters. The actual torque/power limiting
+    % must be done inside the Simulink block systemPowerLimiter.
+    Pwr_system_limit_kW = parsePowerKWMain(getTextField(cfg, 'Raw_SystemPower'));
+
+    if cfg.Hy == 1 && isfinite(Pwr_system_limit_kW) && Pwr_system_limit_kW > 0
+        system_power_limit_enable = 1;
+    else
+        system_power_limit_enable = 0;
+        Pwr_system_limit_kW = 1e9;  % numeric "infinite" limit for Simulink/codegen robustness
+    end
+
+    try
+        assignin('base', 'system_power_limit_enable', system_power_limit_enable);
+        assignin('base', 'Pwr_system_limit_kW', Pwr_system_limit_kW);
+    catch
+    end
+
     %% Result / diagnostics placeholder
     current_result = initRunResult(cfg, runID, inputWarnings);
     current_result.ICE_map_type = string(cp.ICE_map_type);
@@ -502,6 +520,8 @@ for i = start_idx:end_idx
     current_result.Battery_n_s_used = cfg.n_s;
     current_result.Battery_n_p_used = cfg.n_p;
     current_result.SimStatus = "SETUP_OK";
+    current_result.SystemPowerLimit_enable = system_power_limit_enable;
+    current_result.SystemPowerLimit_kW = Pwr_system_limit_kW;
 
     % Make actual Vmax/targets visible to optional Simulink stop/KPI blocks.
     vmaxLimit = getNumericField(cfg, 'Actual_max_speed_kmh', NaN);
@@ -780,7 +800,13 @@ end
 
 
 function results_table = addActualComparison(results_table, actual_values_filename)
-    % Adds ActualValues and error columns when DoE_ActualValues.xlsx is available.
+    % Adds ActualValues and validation-aware error columns when the
+    % V11 DoE_Inp_ActualValues.xlsx file is available.
+    %
+    % Important: Valid_Actual_0_to_100 is respected. Invalid/missing or
+    % explicitly excluded reference values are kept in the result table for
+    % traceability, but they are not used for Error_0_to_100_* or pass-rate
+    % calculations.
     if isempty(results_table) || ~ismember('RUN_ID', results_table.Properties.VariableNames)
         return;
     end
@@ -804,6 +830,7 @@ function results_table = addActualComparison(results_table, actual_values_filena
         return;
     end
 
+    nRes = height(results_table);
     resultRunIDs = str2double(string(results_table.RUN_ID));
     actualRunIDs = str2double(string(actualT{:, runCol}));
     [tf, loc] = ismember(resultRunIDs, actualRunIDs);
@@ -815,7 +842,7 @@ function results_table = addActualComparison(results_table, actual_values_filena
     if ~isempty(actual0100Col)
         actualVals = str2double(string(actualT{:, actual0100Col}));
         if ~ismember('Actual_0_to_100_s', results_table.Properties.VariableNames)
-            results_table.Actual_0_to_100_s = NaN(height(results_table), 1);
+            results_table.Actual_0_to_100_s = NaN(nRes, 1);
         end
         results_table.Actual_0_to_100_s(tf) = actualVals(loc(tf));
     end
@@ -827,10 +854,38 @@ function results_table = addActualComparison(results_table, actual_values_filena
     if ~isempty(actualVmaxCol)
         actualVmax = str2double(string(actualT{:, actualVmaxCol}));
         if ~ismember('Actual_max_speed_kmh', results_table.Properties.VariableNames)
-            results_table.Actual_max_speed_kmh = NaN(height(results_table), 1);
+            results_table.Actual_max_speed_kmh = NaN(nRes, 1);
         end
         results_table.Actual_max_speed_kmh(tf) = actualVmax(loc(tf));
     end
+
+    validActual = true(nRes, 1);
+    warningActual = strings(nRes, 1);
+    p2wActual = NaN(nRes, 1);
+
+    validCol = find(strcmpi(actualVars, 'Valid_Actual_0_to_100'), 1);
+    if ~isempty(validCol)
+        validRaw = actualT{:, validCol};
+        validAll = parseLogicalVectorMain(validRaw);
+        validActual(:) = false;
+        validActual(tf) = validAll(loc(tf));
+    end
+
+    warnCol = find(strcmpi(actualVars, 'Actual_0_to_100_Warning'), 1);
+    if ~isempty(warnCol)
+        warnAll = string(actualT{:, warnCol});
+        warningActual(tf) = warnAll(loc(tf));
+    end
+
+    p2wCol = find(strcmpi(actualVars, 'PowerToWeight_kW_per_t'), 1);
+    if ~isempty(p2wCol)
+        p2wAll = str2double(string(actualT{:, p2wCol}));
+        p2wActual(tf) = p2wAll(loc(tf));
+    end
+
+    results_table.Valid_Actual_0_to_100 = validActual;
+    results_table.Actual_0_to_100_Warning = warningActual;
+    results_table.Actual_PowerToWeight_kW_per_t = p2wActual;
 
     simCol = '';
     if ismember('SL_time_0_to_100', results_table.Properties.VariableNames)
@@ -842,24 +897,30 @@ function results_table = addActualComparison(results_table, actual_values_filena
     if ~isempty(simCol) && ismember('Actual_0_to_100_s', results_table.Properties.VariableNames)
         simVals = str2double(string(results_table.(simCol)));
         actualVals = str2double(string(results_table.Actual_0_to_100_s));
-        results_table.Error_0_to_100_s = simVals - actualVals;
-        results_table.Error_0_to_100_pct = 100 .* results_table.Error_0_to_100_s ./ actualVals;
+        comparisonValid = isfinite(simVals) & isfinite(actualVals) & actualVals > 0 & simVals > 0 & validActual;
+
+        results_table.Comparison_0_to_100_valid = comparisonValid;
+        results_table.Error_0_to_100_s_all = simVals - actualVals;
+        results_table.Error_0_to_100_pct_all = 100 .* results_table.Error_0_to_100_s_all ./ actualVals;
+        results_table.Error_0_to_100_s = NaN(nRes, 1);
+        results_table.Error_0_to_100_pct = NaN(nRes, 1);
+        results_table.Within_10pct_0_to_100 = false(nRes, 1);
+        results_table.Error_0_to_100_s(comparisonValid) = results_table.Error_0_to_100_s_all(comparisonValid);
+        results_table.Error_0_to_100_pct(comparisonValid) = results_table.Error_0_to_100_pct_all(comparisonValid);
+        results_table.Within_10pct_0_to_100(comparisonValid) = abs(results_table.Error_0_to_100_pct(comparisonValid)) <= 10;
     end
 
-    % Prefer the first simulated Vmax column that actually contains finite values.
-    % Some model variants create SL_v_max_kmh as an empty/NaN placeholder while
-    % the usable result is stored in SL_max_speed or SL_max_speed_physical.
     maxCol = pickFirstFiniteColumnMain(results_table, ...
         {'SL_max_speed_limited', 'SL_max_speed_physical', 'SL_max_speed', 'SL_v_max_kmh', 'max_speed'});
     if ~isempty(maxCol) && ismember('Actual_max_speed_kmh', results_table.Properties.VariableNames)
         simV = str2double(string(results_table.(maxCol)));
         actualV = str2double(string(results_table.Actual_max_speed_kmh));
         valid = isfinite(simV) & isfinite(actualV) & actualV > 0;
-        results_table.Error_max_speed_kmh = NaN(height(results_table), 1);
-        results_table.Error_max_speed_pct = NaN(height(results_table), 1);
+        results_table.Error_max_speed_kmh = NaN(nRes, 1);
+        results_table.Error_max_speed_pct = NaN(nRes, 1);
         results_table.Error_max_speed_kmh(valid) = simV(valid) - actualV(valid);
         results_table.Error_max_speed_pct(valid) = 100 .* results_table.Error_max_speed_kmh(valid) ./ actualV(valid);
-        results_table.SL_max_speed_compare_source = repmat(string(maxCol), height(results_table), 1);
+        results_table.SL_max_speed_compare_source = repmat(string(maxCol), nRes, 1);
     end
 end
 
@@ -913,7 +974,8 @@ function [cfg, warnings, errors] = validateAndRepairInput(cfg, runID)
     textDefaults = {'Powertrain', ''; 'mode', 'performance'; 'Gear_Ratio', '[]'; ...
         'Induction_Type', 'NA'; 'SOC_Vector', '[0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]'; ...
         'Cell_OCV_Vector', '[2.8, 3.3, 3.45, 3.52, 3.60, 3.68, 3.75, 3.85, 3.95, 4.1, 4.2]'; ...
-        'Raw_Gearbox', ''; 'Raw_Fuel', ''; 'Transmission_Type', ''; 'Vehicle_Name', ''; 'InputWarnings', ''};
+        'Raw_Gearbox', ''; 'Raw_Fuel', ''; 'Raw_Power', ''; 'Raw_Torque', ''; 'Raw_SystemPower', ''; ...
+        'Transmission_Type', ''; 'Vehicle_Name', ''; 'InputWarnings', ''};
     for k = 1:size(textDefaults, 1)
         if ~isfield(cfg, textDefaults{k,1}) || isempty(cfg.(textDefaults{k,1})) || ismissing(string(cfg.(textDefaults{k,1})))
             cfg.(textDefaults{k,1}) = string(textDefaults{k,2});
@@ -977,7 +1039,7 @@ function [cfg, warnings, errors] = validateAndRepairInput(cfg, runID)
             cfg.AWD = 0;
             cfg.E0 = 1; cfg.E1 = 0; cfg.E2 = 0; cfg.E3 = 0; cfg.E4 = 0;
             cfg.Pwr_P4_max_kW = 0; cfg.tq_P4_max = 0; cfg.n_P4_max = 0;
-            rawPowerFromText_kW = parseFirstNumberMain(getTextField(cfg, 'Raw_Power'));
+            rawPowerFromText_kW = parsePowerKWMain(getTextField(cfg, 'Raw_Power'));
             if isfinite(rawPowerFromText_kW) && rawPowerFromText_kW > 0 && cfg.Pwr_EV_max_kW > 1.35 * rawPowerFromText_kW
                 cfg.Pwr_EV_max_kW = rawPowerFromText_kW;
                 warnings(end+1) = "EV 2WD power capped from Raw_Power"; %#ok<AGROW>
@@ -1058,11 +1120,30 @@ function [cfg, warnings, errors] = validateAndRepairInput(cfg, runID)
     rawAllTxt = lower(string(getTextField(cfg, 'Raw_Fuel')) + " " + ...
                       string(getTextField(cfg, 'Raw_Gearbox')) + " " + ...
                       string(getTextField(cfg, 'Vehicle_Name')) + " " + ...
-                      string(getTextField(cfg, 'Raw_Power')));
+                      string(getTextField(cfg, 'Raw_Power')) + " " + ...
+                      string(getTextField(cfg, 'Raw_SystemPower')));
     hasMildHint = containsAnyMain(rawAllTxt, ["mhev", "mild", "48v", "48 v", "mild-hybrid", "mildhybrid"]);
     lowVoltagePack = isfinite(cfg.n_s) && cfg.n_s > 0 && cfg.n_s <= 25;
     if cfg.Hy == 1 && cfg.P0 == 1 && cfg.P2 == 0 && cfg.P3 == 0 && cfg.P4 == 0 && cfg.P4_DM == 0 && ...
             eAllPowerNoEV_kW > 0 && eAllPowerNoEV_kW <= 25 && (hasMildHint || lowVoltagePack)
+        % V11 safety repair: in some AMS rows Raw_Power is only the 48V/P0
+        % boost machine while Raw_SystemPower contains the real vehicle power.
+        % When the row is converted to ICE, keep the real system power.
+        rawSystemPower_kW = parsePowerKWMain(getTextField(cfg, 'Raw_SystemPower'));
+        if isfinite(rawSystemPower_kW) && rawSystemPower_kW > max(50, 2.5 * max(cfg.Pwr_ICE_max_kW, 1))
+            cfg.Pwr_ICE_max_kW = rawSystemPower_kW;
+            rawTorqueNm = parseTorqueNmMain(getTextField(cfg, 'Raw_Torque'));
+            if isfinite(rawTorqueNm) && rawTorqueNm > 0
+                cfg.tq_ICE_max = rawTorqueNm;
+            else
+                nForTorque = max([cfg.n_ICE_max, 4500]);
+                cfg.tq_ICE_max = estimateTorqueFromPowerMain(cfg.Pwr_ICE_max_kW, nForTorque);
+            end
+            cfg.tq_ICE_idle = 0.20 * cfg.tq_ICE_max;
+            warnings(end+1) = "P0-only mild hybrid ICE power repaired from Raw_SystemPower"; %#ok<AGROW>
+        elseif cfg.Pwr_ICE_max_kW <= 25
+            warnings(end+1) = "P0-only mild hybrid has no usable Raw_SystemPower; exclude from validation"; %#ok<AGROW>
+        end
         cfg.Powertrain = "ICE";
         cfg.VM = 1; cfg.EV = 0; cfg.Hy = 0;
         cfg.P0 = 0; cfg.P2 = 0; cfg.P3 = 0; cfg.P4 = 0; cfg.P4_DM = 0;
@@ -1409,64 +1490,101 @@ function txt = getTextField(s, fieldName)
 end
 
 function mapType = classifyICEMapTypeMain(cfg)
-    % Classify ICE map shape for ComponentParams.
-    % Output:
-    %   'turbo' -> early high-torque plateau, suited for turbo/supercharged ICE
-    %   'na'    -> delayed torque build-up, suited for naturally aspirated ICE
+    % Specific ICE map classification for ComponentParams V13.
 
-    mapType = 'turbo';
+    mapType = 'turbo_petrol';
 
     induction = lower(strtrim(string(getTextField(cfg, 'Induction_Type'))));
     boost = getNumericField(cfg, 'Boost_Pressure_bar', 0);
+
+    pwr_kW = getNumericField(cfg, 'Pwr_ICE_max_kW', 0);
+    tq_Nm  = getNumericField(cfg, 'tq_ICE_max', 0);
+    nMax   = getNumericField(cfg, 'n_ICE_max', 0);
+    disp_cc = getNumericField(cfg, 'Displacement_cc', 0);
+
+    if disp_cc > 0
+        specPower_kW_per_L = pwr_kW / (disp_cc / 1000);
+    else
+        specPower_kW_per_L = NaN;
+    end
 
     allTxt = lower(strjoin([ ...
         string(getTextField(cfg, 'Induction_Type')), ...
         string(getTextField(cfg, 'Raw_Fuel')), ...
         string(getTextField(cfg, 'Raw_Power')), ...
+        string(getTextField(cfg, 'Raw_Torque')), ...
         string(getTextField(cfg, 'Raw_Gearbox')), ...
         string(getTextField(cfg, 'Transmission_Type')), ...
         string(getTextField(cfg, 'Vehicle_Name')), ...
         string(getTextField(cfg, 'Powertrain'))], " "));
 
-    % Strong charged-engine hints. This is evaluated before NA hints because
-    % the current converter defaults Induction_Type to 'NA' for older CSVs.
-    hasTurboHint = boost > 0.05 || ...
-        containsAnyMain(allTxt, [ ...
-            "turbo", "turbocharged", "biturbo", "bi-turbo", "twin turbo", ...
-            "supercharged", "supercharger", "kompressor", ...
-            "tsi", "tfsi", "t-gdi", "tgdi", "gdi turbo", ...
-            "tdi", "cdi", "dci", "hdi", "jtd", "crdi", "bluehdi"]);
+    isDiesel = containsAnyMain(allTxt, ...
+        ["diesel", "tdi", "cdi", "dci", "hdi", "jtd", "crdi", "bluehdi"]);
 
-    % Exact / robust NA hints. Avoid broad contains(...,'na') because that can
-    % accidentally match unrelated words.
-    hasNAHint = any(induction == ["na", "n/a", "naturally aspirated", "naturally_aspirated", ...
-                                  "saugmotor", "sauger", "aspirated"]) || ...
-        containsAnyMain(allTxt, ["naturally aspirated", "naturally-aspirated", "saugmotor", "sauger"]);
+    hasTurboHint = boost > 0.05 || containsAnyMain(allTxt, ...
+        ["turbo", "turbocharged", "biturbo", "bi-turbo", "twin turbo", ...
+         "supercharged", "supercharger", "kompressor", ...
+         "tsi", "tfsi", "t-gdi", "tgdi", "gdi turbo", ...
+         "tdi", "cdi", "dci", "hdi", "jtd", "crdi", "bluehdi"]);
 
+    hasNAHint = any(induction == ["na", "n/a", "naturally aspirated", ...
+                                  "naturally_aspirated", "saugmotor", ...
+                                  "sauger", "aspirated"]) || ...
+        containsAnyMain(allTxt, ...
+        ["naturally aspirated", "naturally-aspirated", "saugmotor", "sauger"]);
+
+    % Diesel first
+    if isDiesel
+        mapType = 'diesel_turbo';
+        return;
+    end
+
+    % Explicit NA / high-rpm NA
+    if hasNAHint && ~hasTurboHint
+        if nMax >= 8500 || (isfinite(specPower_kW_per_L) && specPower_kW_per_L > 85 && nMax >= 7800)
+            mapType = 'high_rpm_na';
+        elseif disp_cc > 0 && disp_cc < 1800
+            mapType = 'small_na';
+        else
+            mapType = 'large_na';
+        end
+        return;
+    end
+
+    % Explicit turbo / charged petrol
     if hasTurboHint
-        mapType = 'turbo';
+        if disp_cc > 0 && disp_cc < 1800
+            mapType = 'small_turbo_petrol';
+        elseif isfinite(specPower_kW_per_L) && specPower_kW_per_L >= 95
+            mapType = 'performance_turbo';
+        elseif pwr_kW >= 300
+            mapType = 'performance_turbo';
+        else
+            mapType = 'turbo_petrol';
+        end
         return;
     end
 
-    if hasNAHint
-        mapType = 'na';
-        return;
-    end
-
-    % Fallback heuristic for unknown inputs:
-    % If the speed implied by Pmax/Tmax is relatively high, the engine behaves
-    % more like an NA engine. If torque is available very early relative to power,
-    % it behaves more like a turbo engine.
-    pwr_kW = getNumericField(cfg, 'Pwr_ICE_max_kW', 0);
-    tq_Nm  = getNumericField(cfg, 'tq_ICE_max', 0);
-    nMax   = getNumericField(cfg, 'n_ICE_max', 0);
-
+    % Fallback without clear text hints
     if pwr_kW > 0 && tq_Nm > 0 && nMax > 0
         nPowerAtMaxTorque = pwr_kW * 9549.3 / tq_Nm;
-        if nPowerAtMaxTorque > 0.55 * nMax
-            mapType = 'na';
+
+        if nMax >= 8500
+            mapType = 'high_rpm_na';
+        elseif nPowerAtMaxTorque > 0.60 * nMax
+            if disp_cc > 0 && disp_cc < 1800
+                mapType = 'small_na';
+            else
+                mapType = 'large_na';
+            end
         else
-            mapType = 'turbo';
+            if disp_cc > 0 && disp_cc < 1800
+                mapType = 'small_turbo_petrol';
+            elseif isfinite(specPower_kW_per_L) && specPower_kW_per_L >= 95
+                mapType = 'performance_turbo';
+            else
+                mapType = 'turbo_petrol';
+            end
         end
     end
 end
@@ -1562,8 +1680,88 @@ function x = parseFirstNumberMain(s)
     if isempty(tok)
         x = NaN;
     else
-        x = str2double(strrep(tok, ',', '.'));
+        x = parseLocalizedNumberMain(tok);
     end
+end
+
+function p = parsePowerKWMain(s)
+    txt = char(string(s));
+    p = NaN;
+    if isempty(strtrim(txt))
+        return;
+    end
+    tok = regexp(txt, '([-+]?\d+(?:[.,]\d+)?)\s*kW', 'tokens', 'once', 'ignorecase');
+    if ~isempty(tok)
+        p = parseLocalizedNumberMain(tok{1});
+        return;
+    end
+    tok = regexp(txt, '([-+]?\d+(?:[.,]\d+)?)\s*PS', 'tokens', 'once', 'ignorecase');
+    if ~isempty(tok)
+        p = parseLocalizedNumberMain(tok{1}) * 0.735499;
+    end
+end
+
+function tq = parseTorqueNmMain(s)
+    txt = char(string(s));
+    tq = NaN;
+    if isempty(strtrim(txt))
+        return;
+    end
+    tok = regexp(txt, '([-+]?\d+(?:[.,]\d+)?)\s*Nm', 'tokens', 'once', 'ignorecase');
+    if ~isempty(tok)
+        tq = parseLocalizedNumberMain(tok{1});
+    end
+end
+
+function x = parseLocalizedNumberMain(tok)
+    % Handles German/AMS thousands separators without breaking decimals:
+    %   1.103 kW -> 1103
+    %   1.177 kW -> 1177
+    %   2,4 s    -> 2.4
+    %   3.54     -> 3.54
+    tok = char(string(tok));
+    tok = strtrim(tok);
+    tok = strrep(tok, '''', '');
+    tok = regexprep(tok, '\s+', '');
+    if isempty(tok)
+        x = NaN;
+        return;
+    end
+
+    hasDot = contains(tok, '.');
+    hasComma = contains(tok, ',');
+
+    if hasDot && hasComma
+        lastDot = find(tok == '.', 1, 'last');
+        lastComma = find(tok == ',', 1, 'last');
+        if lastComma > lastDot
+            tok = strrep(tok, '.', '');
+            tok = strrep(tok, ',', '.');
+        else
+            tok = strrep(tok, ',', '');
+        end
+    elseif hasDot
+        parts = regexp(tok, '\.', 'split');
+        if numel(parts) == 2 && numel(parts{2}) == 3 && numel(parts{1}) >= 1 && numel(parts{1}) <= 3
+            tok = strrep(tok, '.', '');
+        end
+    elseif hasComma
+        tok = strrep(tok, ',', '.');
+    end
+
+    x = str2double(tok);
+end
+
+function tf = parseLogicalVectorMain(x)
+    sx = lower(strtrim(string(x)));
+    tf = sx == "true" | sx == "1" | sx == "yes" | sx == "ja";
+    if isnumeric(x) || islogical(x)
+        try
+            tf = logical(double(x));
+        catch
+        end
+    end
+    tf = tf(:);
 end
 
 function tf = containsAnyMain(txt, patterns)
@@ -1597,6 +1795,7 @@ function patchGearRatioLookupBreakpoints(modelName)
         lookupBlocks = find_system(modelName, ...
             'LookUnderMasks', 'all', ...
             'FollowLinks', 'on', ...
+            'MatchFilter', @Simulink.match.allVariants, ...
             'BlockType', 'Lookup_n-D');
 
         nPatched = 0;
@@ -1854,7 +2053,7 @@ end
 
 function createActualVsSim0100Plot(results_table, output_file)
     % Creates an Actual-vs-Simulated 0-100 km/h comparison plot.
-    % Intended for the local debug export folder before ZIP creation.
+    % Invalid V11 ActualValues are excluded from the plotted/pass-rate sample.
 
     if isempty(results_table) || height(results_table) < 1
         fprintf('No results available. Skipping 0-100 comparison plot.\n');
@@ -1877,15 +2076,24 @@ function createActualVsSim0100Plot(results_table, output_file)
         return;
     end
 
-    actual = str2double(string(results_table.Actual_0_to_100_s));
-    simVal = str2double(string(results_table.(simCol)));
+    actualAll = str2double(string(results_table.Actual_0_to_100_s));
+    simAll = str2double(string(results_table.(simCol)));
 
-    valid = isfinite(actual) & isfinite(simVal) & actual > 0 & simVal > 0;
-    actual = actual(valid);
-    simVal = simVal(valid);
+    validActual = true(height(results_table), 1);
+    if ismember('Comparison_0_to_100_valid', varNames)
+        validActual = parseLogicalVectorMain(results_table.Comparison_0_to_100_valid);
+    elseif ismember('Valid_Actual_0_to_100', varNames)
+        validActual = parseLogicalVectorMain(results_table.Valid_Actual_0_to_100);
+    end
+
+    valid = isfinite(actualAll) & isfinite(simAll) & actualAll > 0 & simAll > 0 & validActual;
+    nExcluded = sum(isfinite(actualAll) & isfinite(simAll) & actualAll > 0 & simAll > 0 & ~validActual);
+
+    actual = actualAll(valid);
+    simVal = simAll(valid);
 
     if isempty(actual)
-        fprintf('No valid Actual/Simulated 0-100 values. Skipping comparison plot.\n');
+        fprintf('No valid Actual/Simulated 0-100 values after V11 validation filter. Skipping comparison plot.\n');
         return;
     end
 
@@ -1905,18 +2113,17 @@ function createActualVsSim0100Plot(results_table, output_file)
     fig = figure('Visible', 'off', 'Color', 'w', 'Position', [100 100 1100 950]);
     hold on;
 
-    % Scatter groups. Colors match the intended readable green/orange style.
     if any(within10)
         scatter(actual(within10), simVal(within10), 55, ...
             'MarkerFaceColor', [0.20 0.78 0.45], ...
             'MarkerEdgeColor', 'w', ...
             'MarkerFaceAlpha', 0.85, ...
-            'DisplayName', sprintf('Within 10%% Tolerance (%d runs)', nPass));
+            'DisplayName', sprintf('Within 10%% Tolerance (%d valid runs)', nPass));
     else
         scatter(NaN, NaN, 55, ...
             'MarkerFaceColor', [0.20 0.78 0.45], ...
             'MarkerEdgeColor', 'w', ...
-            'DisplayName', 'Within 10% Tolerance (0 runs)');
+            'DisplayName', 'Within 10% Tolerance (0 valid runs)');
     end
 
     nFail = nValid - nPass;
@@ -1925,18 +2132,18 @@ function createActualVsSim0100Plot(results_table, output_file)
             'MarkerFaceColor', [0.93 0.45 0.12], ...
             'MarkerEdgeColor', 'w', ...
             'MarkerFaceAlpha', 0.85, ...
-            'DisplayName', sprintf('Outside 10%% Tolerance (%d runs)', nFail));
+            'DisplayName', sprintf('Outside 10%% Tolerance (%d valid runs)', nFail));
     else
         scatter(NaN, NaN, 55, ...
             'MarkerFaceColor', [0.93 0.45 0.12], ...
             'MarkerEdgeColor', 'w', ...
-            'DisplayName', 'Outside 10% Tolerance (0 runs)');
+            'DisplayName', 'Outside 10% Tolerance (0 valid runs)');
     end
 
     plot(xLine, xLine, ':', 'Color', [0.10 0.18 0.28], 'LineWidth', 3, ...
         'DisplayName', 'Perfect Match (y = x)');
     plot(xLine, 1.10 .* xLine, '--', 'Color', [0.00 0.45 0.74], 'LineWidth', 2.2, ...
-        'DisplayName', '±10% Tolerance Bands');
+        'DisplayName', '+/-10% Tolerance Bands');
     plot(xLine, 0.90 .* xLine, '--', 'Color', [0.00 0.45 0.74], 'LineWidth', 2.2, ...
         'HandleVisibility', 'off');
 
@@ -1953,7 +2160,8 @@ function createActualVsSim0100Plot(results_table, output_file)
     lgd = legend('Location', 'northwest');
     set(lgd, 'FontSize', 13);
 
-    txt = sprintf('Pass Rate: %.1f%%\n(%d / %d runs)', passRate, nPass, nValid);
+    txt = sprintf('Valid pass rate: %.1f%%\n(%d / %d valid runs)\nExcluded actuals: %d', ...
+        passRate, nPass, nValid, nExcluded);
     text(0.98, 0.04, txt, ...
         'Units', 'normalized', ...
         'HorizontalAlignment', 'right', ...
@@ -1971,6 +2179,5 @@ function createActualVsSim0100Plot(results_table, output_file)
     end
     close(fig);
 
-    fprintf('0-100 comparison plot saved:\n%s\n', char(string(output_file)));
+    fprintf('0-100 comparison plot saved with V11 actual validation filter:\n%s\n', char(string(output_file)));
 end
-

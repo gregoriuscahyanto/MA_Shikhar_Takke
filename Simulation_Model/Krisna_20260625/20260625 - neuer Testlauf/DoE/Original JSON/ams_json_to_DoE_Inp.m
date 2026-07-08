@@ -19,7 +19,7 @@ function ams_json_to_DoE_Inp(inputFile, outBase)
 %   - Actual 0-100 km/h values are written to a separate sheet/file because
 %     they are validation targets, not simulation inputs.
 
-    fprintf("ams_json_to_DoE_Inp POWERTRAIN_EV_FIX_V11_P0_POWER_AND_VALIDATION_FIX\n");
+    fprintf("ams_json_to_DoE_Inp POWERTRAIN_EV_FIX_V12_HIGH_RPM_ICE_AND_INDUCTION_FIX\n");
 
     if nargin < 1 || strlength(safeStringScalar(inputFile)) == 0
         if isfile("webscraper_auto_motor_sport_marken_modelle.zip")
@@ -419,7 +419,7 @@ function row = convertRawToDoeRow(raw, emptyRow)
     row.Transmission_Type = resolveTransmissionType(raw.gearboxText, row.Powertrain);
 
     row.Displacement_cc = fallback(raw.displacement_cc, 0);
-    row.Induction_Type = estimateInductionType(raw.boostText, raw.power_kW, raw.displacement_cc);
+    row.Induction_Type = estimateInductionType(raw.boostText, raw.power_kW, raw.displacement_cc, raw.power_rpm, raw.fuelText, raw.vehicleName, raw.powerText);
     row.Boost_Pressure_bar = estimateBoostPressure(row.Induction_Type);
 
     if row.VM == 1 || row.Hy == 1
@@ -1737,12 +1737,40 @@ function type = resolveTransmissionType(gearboxText, powertrain)
     end
 end
 
-function type = estimateInductionType(boostText, power_kW, disp_cc)
-    txt = safeLowerString(boostText);
-    if contains(txt, "turbo") || contains(txt, "kompressor") || contains(txt, "lader")
+function type = estimateInductionType(boostText, power_kW, disp_cc, powerRpm, fuelText, vehicleName, powerText)
+    % Robust induction classification for AMS data.
+    % Do not classify high-specific-output engines as turbo solely from kW/l.
+    % Example: Porsche 918 / Ferrari / Lamborghini high-rpm NA engines can
+    % exceed 80 kW/l but are still naturally aspirated.
+    txt = safeLowerString(strjoin([safeStringScalar(boostText), safeStringScalar(fuelText), ...
+        safeStringScalar(vehicleName), safeStringScalar(powerText)], " "));
+
+    hasForcedInductionHint = containsAny(txt, ["turbo", "biturbo", "bi-turbo", "twin turbo", ...
+        "kompressor", "supercharged", "supercharger", "lader", "aufladung", ...
+        "tsi", "tfsi", "tdi", "cdi", "dci", "hdi", "jtd", "crdi", "bluehdi"]);
+    hasNAHint = containsAny(txt, ["saugmotor", "sauger", "naturally aspirated", "naturally-aspirated"]);
+    isDiesel = contains(txt, "diesel") || containsAny(txt, ["tdi", "cdi", "dci", "hdi", "jtd", "crdi", "bluehdi"]);
+
+    if hasForcedInductionHint || isDiesel
         type = "Turbo";
-    elseif isfinite(power_kW) && isfinite(disp_cc) && disp_cc > 0 && power_kW / (disp_cc/1000) > 80
-        type = "Turbo";
+        return;
+    end
+
+    % High power rpm without any forced-induction hint is a strong NA signal.
+    if hasNAHint || (isfinite(powerRpm) && powerRpm >= 7500)
+        type = "NA";
+        return;
+    end
+
+    % Weak fallback only: high specific output suggests forced induction mainly
+    % when peak power is not at very high rpm.
+    if isfinite(power_kW) && isfinite(disp_cc) && disp_cc > 0
+        specificPower = power_kW / (disp_cc/1000);
+        if specificPower > 95 && (~isfinite(powerRpm) || powerRpm < 7200)
+            type = "Turbo";
+        else
+            type = "NA";
+        end
     else
         type = "NA";
     end
@@ -1763,11 +1791,21 @@ function rpmMax = estimateIceMaxRpm(powerRpm, fuelText, inductionType)
     elseif contains(fuel, "diesel")
         rpmMax = 5000;
     elseif string(inductionType) == "Turbo"
-        rpmMax = 6500;
+        rpmMax = 7000;
     else
-        rpmMax = 6500;
+        rpmMax = 7200;
     end
-    rpmMax = min(max(rpmMax, 4500), 8000);
+
+    % Keep normal engines in the previous range, but allow high-rpm NA engines
+    % from AMS entries such as "447 kW bei 8700 U/min".
+    if isfinite(powerRpm) && powerRpm >= 7500
+        upperRpm = 9500;
+    elseif contains(fuel, "diesel")
+        upperRpm = 5500;
+    else
+        upperRpm = 8000;
+    end
+    rpmMax = min(max(rpmMax, 4500), upperRpm);
 end
 
 function tq = estimateTorqueFromPower(pwr_kW, rpm)
