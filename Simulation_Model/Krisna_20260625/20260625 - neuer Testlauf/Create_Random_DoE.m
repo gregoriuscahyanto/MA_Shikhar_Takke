@@ -4,7 +4,7 @@ clear; clc;
 % doe_file = "DoE_Inp_ICE.csv";
 doe_file = "DoE_Inp.csv";
 
-nPick = 52;
+nPick = 51;
 requireActual0100 = true;   % nur Zeilen mit vorhandenem 0-100-Actual-Wert ziehen
 minInputQualityScore = 0;   % optional z.B. 40 setzen, wenn schlechte Inputs raus sollen
 excludeSuspiciousRows = true;
