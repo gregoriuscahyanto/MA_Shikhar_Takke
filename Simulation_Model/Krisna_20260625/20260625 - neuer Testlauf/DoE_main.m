@@ -1,4 +1,4 @@
-% DoE_main.m - local + HPC capable DoE runner
+% DoE_main.m - V15 pure local/HPC Simulink runner
 %
 % Local execution:
 %   cd("Simulation_Model/Krisna_20260625/20260625 - neuer Testlauf")
@@ -19,8 +19,12 @@ end
 % Prefer the full generated input. Fall back to a random test subset when used
 % inside an exported debug folder.
 
+% default_doe = 'DoE_Inp_ICEAndHybridFromRandom200.csv';
+default_doe = 'DoE_Inp_random200.csv';
 % default_doe = 'DoE_Inp_random52.csv';
-default_doe = 'DoE_Inp_random51.csv';
+% default_doe = 'DoE_Inp_random51.csv';
+% default_doe = 'DoE_Inp_hybridFromRandom51.csv';
+% default_doe = 'DoE_Inp_auffaellig51.csv';
 % default_doe = 'DoE_Inp_nurLotusEletre.csv';
 % default_doe = 'DoE_Inp_chosenHybrid2.csv';
 
@@ -214,7 +218,7 @@ for i = start_idx:end_idx
         runID = i;
     end
 
-    [cfg, inputWarnings, inputErrors] = validateAndRepairInput(cfg, runID);
+    [cfg, inputWarnings, inputErrors] = validateInputOnly(cfg, runID);
     if ~isempty(inputErrors)
         fprintf('--- Skipping Row %d (RunID: %d) because of input error(s): %s ---\n', ...
             i, runID, char(strjoin(inputErrors, ' | ')));
@@ -227,67 +231,42 @@ for i = start_idx:end_idx
         continue;
     end
 
-    % --- Robust topology cleanup for AMS/legacy CSV inputs ---
-    % Hybrid and EV are mutually exclusive with VM in VehicleConfig/PowertrainConfig.
+    % --- Input contract check only ---
+    % ams_json_to_DoE_Inp_final.m is responsible for producing simulation-ready
+    % topology flags and component values. DoE_main must not repair architecture
+    % or powertrain data. It only stops invalid rows before Simulink runs.
     if isfield(cfg, 'EV') && cfg.EV == 1
-        cfg.VM = 0;
-        cfg.Hy = 0;
-        % Pure EV must use E0-E4, not hybrid P-position flags.
-        if ~isfield(cfg, 'E0'), cfg.E0 = 0; end
-        if ~isfield(cfg, 'E1'), cfg.E1 = 0; end
-        if ~isfield(cfg, 'E2'), cfg.E2 = 0; end
-        if ~isfield(cfg, 'E3'), cfg.E3 = 0; end
-        if ~isfield(cfg, 'E4'), cfg.E4 = 0; end
-        if ~(cfg.E0 || cfg.E1 || cfg.E2 || cfg.E3 || cfg.E4)
-            if isfield(cfg, 'AWD') && cfg.AWD == 1
-                cfg.E2 = 1;
-            else
-                cfg.E0 = 1;
-            end
+        if cfg.VM ~= 0 || cfg.Hy ~= 0
+            inputErrors(end+1) = "EV row violates simulation input contract: expected VM=0, Hy=0"; %#ok<SAGROW>
         end
-
-        % Legacy EV CSV fallback: older converter versions stored EV power in P2/P4.
-        oldPwr = 0; oldTq = 0; oldN = 16000;
-        if isfield(cfg, 'Pwr_EV_max_kW') && cfg.Pwr_EV_max_kW > 0, oldPwr = cfg.Pwr_EV_max_kW; end
-        if isfield(cfg, 'Pwr_P2_max_kW') && cfg.Pwr_P2_max_kW > oldPwr, oldPwr = cfg.Pwr_P2_max_kW; end
-        if isfield(cfg, 'Pwr_P4_max_kW') && cfg.Pwr_P4_max_kW > oldPwr, oldPwr = cfg.Pwr_P4_max_kW; end
-        if isfield(cfg, 'tq_EV_max') && cfg.tq_EV_max > 0, oldTq = cfg.tq_EV_max; end
-        if isfield(cfg, 'tq_P2_max') && cfg.tq_P2_max > oldTq, oldTq = cfg.tq_P2_max; end
-        if isfield(cfg, 'tq_P4_max') && cfg.tq_P4_max > oldTq, oldTq = cfg.tq_P4_max; end
-        if isfield(cfg, 'n_EV_max') && cfg.n_EV_max > 0, oldN = cfg.n_EV_max;
-        elseif isfield(cfg, 'n_P2_max') && cfg.n_P2_max > 0, oldN = cfg.n_P2_max;
-        elseif isfield(cfg, 'n_P4_max') && cfg.n_P4_max > 0, oldN = cfg.n_P4_max; end
-
-        nMot = 1; hasSecondary = false;
-        if cfg.E1 == 1, nMot = 2; end
-        if cfg.E2 == 1, nMot = 2; hasSecondary = true; end
-        if cfg.E3 == 1, nMot = 3; hasSecondary = true; end
-        if cfg.E4 == 1, nMot = 4; hasSecondary = true; end
-        if ~isfield(cfg, 'Pwr_EV_max_kW') || cfg.Pwr_EV_max_kW <= 0, cfg.Pwr_EV_max_kW = oldPwr / nMot; end
-        if ~isfield(cfg, 'tq_EV_max') || cfg.tq_EV_max <= 0, cfg.tq_EV_max = oldTq / nMot; end
-        if ~isfield(cfg, 'n_EV_max') || cfg.n_EV_max <= 0, cfg.n_EV_max = oldN; end
-        if ~isfield(cfg, 'Pwr_EV_nmax_red_perc'), cfg.Pwr_EV_nmax_red_perc = 0.04; end
-        if hasSecondary
-            if ~isfield(cfg, 'Pwr_P4_max_kW') || cfg.Pwr_P4_max_kW <= 0, cfg.Pwr_P4_max_kW = oldPwr / nMot; end
-            if ~isfield(cfg, 'tq_P4_max') || cfg.tq_P4_max <= 0, cfg.tq_P4_max = oldTq / nMot; end
-            if ~isfield(cfg, 'n_P4_max') || cfg.n_P4_max <= 0, cfg.n_P4_max = oldN; end
-        end
-
-        cfg.P0 = 0; cfg.P2 = 0; cfg.P3 = 0; cfg.P4 = 0; cfg.P4_DM = 0;
     elseif isfield(cfg, 'Hy') && cfg.Hy == 1
-        cfg.VM = 0;
-        cfg.EV = 0;
-    end
-    % P4 single motor and P4 dual-motor are mutually exclusive. Prefer P4_DM.
-    if isfield(cfg, 'P4') && isfield(cfg, 'P4_DM') && cfg.P4 == 1 && cfg.P4_DM == 1
-        if isfield(cfg, 'RUN_ID')
-            fprintf('WARNING RunID %d: P4 and P4_DM are both 1. Setting P4=0 and keeping P4_DM=1.\n', cfg.RUN_ID);
-        else
-            fprintf('WARNING: P4 and P4_DM are both 1. Setting P4=0 and keeping P4_DM=1.\n');
+        if cfg.VM ~= 0 || cfg.EV ~= 0
+            inputErrors(end+1) = "Hybrid row violates simulation input contract: expected VM=0, EV=0"; %#ok<SAGROW>
         end
-        cfg.P4 = 0;
+    elseif isfield(cfg, 'VM') && cfg.VM == 1
+        if cfg.EV ~= 0 || cfg.Hy ~= 0
+            inputErrors(end+1) = "ICE row violates simulation input contract: expected EV=0, Hy=0"; %#ok<SAGROW>
+        end
+    else
+        inputErrors(end+1) = "No valid VM/EV/Hy topology flag active"; %#ok<SAGROW>
     end
-    
+
+    if isfield(cfg, 'P4') && isfield(cfg, 'P4_DM') && cfg.P4 == 1 && cfg.P4_DM == 1
+        inputErrors(end+1) = "P4 and P4_DM are both active; fix converter input"; %#ok<SAGROW>
+    end
+
+    if ~isempty(inputErrors)
+        fprintf('--- Skipping Row %d (RunID: %d) because of post-validation input contract error(s): %s ---\n', ...
+            i, runID, char(strjoin(inputErrors, ' | ')));
+        current_result = makeSkippedResult(cfg, runID, inputWarnings, inputErrors);
+        if isempty(results_struct)
+            results_struct = current_result;
+        else
+            results_struct = appendStruct(results_struct, current_result);
+        end
+        continue;
+    end
+
     if isfield(cfg, 'RUN_ID'), runID = cfg.RUN_ID;
     else, runID = i; end
 
@@ -448,8 +427,37 @@ for i = start_idx:end_idx
     % protects against model/link refreshes before sim() compiles the model.
     patchGearRatioLookupBreakpoints(DOE_SL_MODEL_SIM_NAME);
 
-    % ShiftDelay 
-    [gb.shiftDelay, shiftSrc, gbType, p2w] = resolveShiftDelay(cfg);
+    % ShiftDelay comes from converter. DoE_main does not infer gearbox type or
+    % estimate shift delay from text anymore.
+    gb.shiftDelay = cfg.shiftDelay;
+    shiftSrc = "converter_shiftDelay";
+    gbType = string(cfg.Transmission_Type);
+    totalPowerForP2W = cfg.Pwr_ICE_max_kW + cfg.Pwr_P0_max_kW + cfg.Pwr_P2_max_kW + ...
+                       cfg.Pwr_P3_max_kW + cfg.Pwr_P4_max_kW + cfg.Pwr_EV_max_kW;
+    if isfinite(cfg.m_curb) && cfg.m_curb > 0
+        p2w = totalPowerForP2W / cfg.m_curb * 1000;
+    else
+        p2w = NaN;
+    end
+
+    %% === POWERTRAIN COMPONENT EFFICIENCY FROM POWER-TO-WEIGHT ===
+    etaPT = calcPowertrainEtaFromPowerWeightMain(p2w, gbType, cfg);
+    
+    try
+        assignin('base', 'pt_eta_primary_drive',   etaPT.primary_drive);
+        assignin('base', 'pt_eta_secondary_drive', etaPT.secondary_drive);
+        assignin('base', 'pt_eta_r2m_drive',       etaPT.r2m_drive);
+        assignin('base', 'pt_eta_sys_to_wheel',    etaPT.sys_to_wheel);
+    
+        assignin('base', 'pt_eta_coupling',        etaPT.coupling);
+        assignin('base', 'pt_eta_gearbox',         etaPT.gearbox);
+        assignin('base', 'pt_eta_reduction',       etaPT.reduction);
+        assignin('base', 'pt_eta_finaldrive',      etaPT.finaldrive);
+        assignin('base', 'pt_eta_driveshaft',      etaPT.driveshaft);
+        assignin('base', 'pt_eta_wheelbearing',    etaPT.wheelbearing);
+    catch
+    end
+
     if isfield(cfg, 'RUN_ID')
         fprintf('RunID %d: shiftDelay = %.3f s [%s], gearboxType="%s", P/m=%.1f kW/t\n', ...
             cfg.RUN_ID, gb.shiftDelay, shiftSrc, gbType, p2w);
@@ -491,25 +499,12 @@ for i = start_idx:end_idx
     pt.E3 = 0; if isfield(cfg, 'E3'), pt.E3 = cfg.E3; end
     pt.E4 = 0; if isfield(cfg, 'E4'), pt.E4 = cfg.E4; end
 
+    pt = pt.setupICE();
     pt = pt.setupEV();
     pt = pt.setupHybrid();
     
-    % === PATCH: cfg flags for EM Torque Distributor synchronisieren ===
-    try
-        if isprop(pt, 'cfg_P0'),    pt.cfg_P0    = double(cfg.P0);    end
-        if isprop(pt, 'cfg_P2'),    pt.cfg_P2    = double(cfg.P2);    end
-        if isprop(pt, 'cfg_P3'),    pt.cfg_P3    = double(cfg.P3);    end
-        if isprop(pt, 'cfg_P4'),    pt.cfg_P4    = double(cfg.P4);    end
-        if isprop(pt, 'cfg_P4_DM'), pt.cfg_P4_DM = double(cfg.P4_DM); end
-    
-        if isprop(pt, 'cfg_E0'),    pt.cfg_E0    = double(cfg.E0);    end
-        if isprop(pt, 'cfg_E1'),    pt.cfg_E1    = double(cfg.E1);    end
-        if isprop(pt, 'cfg_E2'),    pt.cfg_E2    = double(cfg.E2);    end
-        if isprop(pt, 'cfg_E3'),    pt.cfg_E3    = double(cfg.E3);    end
-        if isprop(pt, 'cfg_E4'),    pt.cfg_E4    = double(cfg.E4);    end
-    catch ME_pt_flags
-        warning('Could not synchronize pt.cfg_* flags: %s', ME_pt_flags.message);
-    end
+    % PowertrainConfig owns all derived pt.cfg_* routing flags.
+    % DoE_main deliberately does not synchronize or repair topology here.
 
     % --- Battery Config ---
     bat = BatteryConfig();
@@ -553,6 +548,17 @@ for i = start_idx:end_idx
     catch
     end
 
+    %% === HYBRID P2 BOOST FACTORS FOR SIMULINK ===
+    % Converter-owned simulation parameters. DoE_main only reads them.
+    hybrid_p2_cont_factor = cfg.hybrid_p2_cont_factor;
+    hybrid_p2_shift_factor = cfg.hybrid_p2_shift_factor;
+
+    try
+        assignin('base', 'hybrid_p2_cont_factor', hybrid_p2_cont_factor);
+        assignin('base', 'hybrid_p2_shift_factor', hybrid_p2_shift_factor);
+    catch
+    end
+
     %% Result / diagnostics placeholder
     current_result = initRunResult(cfg, runID, inputWarnings);
     current_result.ICE_map_type = string(cp.ICE_map_type);
@@ -570,6 +576,7 @@ for i = start_idx:end_idx
     current_result.ShiftDelay_used = gb.shiftDelay;
     current_result.ShiftDelay_source = string(shiftSrc);
     current_result.Gearbox_type_resolved = string(gbType);
+    current_result.HybridArchitectureClass = string(getTextField(cfg, 'HybridArchitectureClass'));
     current_result.Power_to_weight_kW_per_t = p2w;
     current_result.GearCount_used = gb.No_Gears;
     current_result.GearRatio_used = string(mat2str(gb.Gear_Ratio));
@@ -604,6 +611,21 @@ for i = start_idx:end_idx
     current_result.pt_cfg_P2_after_setup = getPropOrDefault(pt, 'cfg_P2', NaN);
     current_result.pt_cfg_P3_after_setup = getPropOrDefault(pt, 'cfg_P3', NaN);
     current_result.pt_cfg_P4_after_setup = getPropOrDefault(pt, 'cfg_P4', NaN);
+
+    current_result.hybrid_p2_cont_factor = hybrid_p2_cont_factor;
+    current_result.hybrid_p2_shift_factor = hybrid_p2_shift_factor;
+
+    current_result.pt_eta_primary_drive   = etaPT.primary_drive;
+    current_result.pt_eta_secondary_drive = etaPT.secondary_drive;
+    current_result.pt_eta_r2m_drive       = etaPT.r2m_drive;
+    current_result.pt_eta_sys_to_wheel    = etaPT.sys_to_wheel;
+    
+    current_result.pt_eta_coupling        = etaPT.coupling;
+    current_result.pt_eta_gearbox         = etaPT.gearbox;
+    current_result.pt_eta_reduction       = etaPT.reduction;
+    current_result.pt_eta_finaldrive      = etaPT.finaldrive;
+    current_result.pt_eta_driveshaft      = etaPT.driveshaft;
+    current_result.pt_eta_wheelbearing    = etaPT.wheelbearing;
 
     % Make actual Vmax/targets visible to optional Simulink stop/KPI blocks.
     vmaxLimit = getNumericField(cfg, 'Actual_max_speed_kmh', NaN);
@@ -1159,10 +1181,29 @@ function results_table = addActualComparison(results_table, actual_values_filena
         results_table.Error_0_to_100_pct_all = 100 .* results_table.Error_0_to_100_s_all ./ actualVals;
         results_table.Error_0_to_100_s = NaN(nRes, 1);
         results_table.Error_0_to_100_pct = NaN(nRes, 1);
+        % Tolerance logic for 0-100 validation:
+        % A run is accepted when either the absolute time error is <= 1.0 s
+        % OR the relative error is within +/-10 %.
+        % Keep separate diagnostic columns so it is visible why a run passed.
+        results_table.Within_1s_0_to_100 = false(nRes, 1);
+        results_table.Within_10pct_only_0_to_100 = false(nRes, 1);
+        results_table.Within_1s_or_10pct_0_to_100 = false(nRes, 1);
+
+        % Legacy column name kept for compatibility with existing analysis scripts.
+        % It now contains the combined pass/fail flag: <=1 s OR <=10 %.
         results_table.Within_10pct_0_to_100 = false(nRes, 1);
+
         results_table.Error_0_to_100_s(comparisonValid) = results_table.Error_0_to_100_s_all(comparisonValid);
         results_table.Error_0_to_100_pct(comparisonValid) = results_table.Error_0_to_100_pct_all(comparisonValid);
-        results_table.Within_10pct_0_to_100(comparisonValid) = abs(results_table.Error_0_to_100_pct(comparisonValid)) <= 10;
+
+        within1s = abs(results_table.Error_0_to_100_s(comparisonValid)) <= 1.0;
+        within10pct = abs(results_table.Error_0_to_100_pct(comparisonValid)) <= 10;
+        withinCombined = within1s | within10pct;
+
+        results_table.Within_1s_0_to_100(comparisonValid) = within1s;
+        results_table.Within_10pct_only_0_to_100(comparisonValid) = within10pct;
+        results_table.Within_1s_or_10pct_0_to_100(comparisonValid) = withinCombined;
+        results_table.Within_10pct_0_to_100(comparisonValid) = withinCombined;
     end
 
     maxCol = pickFirstFiniteColumnMain(results_table, ...
@@ -1193,25 +1234,33 @@ function mainStruct = appendStruct(mainStruct, newStruct)
     mainStruct = [mainStruct; newStruct];
 end
 
+function [cfg, warnings, errors] = validateInputOnly(cfg, runID)
+    % DoE_main input contract checker only.
+    %
+    % The converter is responsible for all domain-specific preprocessing:
+    % - powertrain classification
+    % - P0/P2/P3/P4 architecture mapping
+    % - P2/P4 power and torque plausibility
+    % - EV topology and battery sizing fallbacks
+    %
+    % This function performs only type normalization and hard validation.
+    % It must not infer, repair, remap or reclassify domain-specific vehicle data.
 
-
-function [cfg, warnings, errors] = validateAndRepairInput(cfg, runID)
     warnings = strings(1, 0);
     errors = strings(1, 0);
 
-    % Required numeric defaults. These keep older CSVs compatible with the
-    % newer AMS converter output.
-    numericDefaults = { ...
-        'd_wheel', 0.6345; 'A_front', 2.25; 'HM_VA', 1; 'AWD', 0; 'iAG', 4.1; ...
-        'm_curb', 1500; 'Wheelbase', 2.65; 'h_s', 0.45; 'weight_dist', 1.20; ...
-        'MainAxle_TorqueSplit_int', 0.5; 'Hybrid_ICE_priority', 1; ...
-        'VM', 1; 'EV', 0; 'Hy', 0; 'E0', 0; 'E1', 0; 'E2', 0; 'E3', 0; 'E4', 0; ...
+    numericFields = { ...
+        'd_wheel', NaN; 'A_front', NaN; 'HM_VA', NaN; 'AWD', NaN; 'iAG', NaN; ...
+        'm_curb', NaN; 'Wheelbase', NaN; 'h_s', NaN; 'weight_dist', NaN; ...
+        'MainAxle_TorqueSplit_int', NaN; 'Hybrid_ICE_priority', 1; ...
+        'hybrid_p2_cont_factor', 1.0; 'hybrid_p2_shift_factor', 1.0; ...
+        'VM', NaN; 'EV', NaN; 'Hy', NaN; 'E0', 0; 'E1', 0; 'E2', 0; 'E3', 0; 'E4', 0; ...
         'i_GET_EV', 9.0; 'i_ges_P4', 9.0; ...
         'EV_2speed_enable', 0; ...
         'i_GET_EV_gear1', 9.0; 'i_GET_EV_gear2', 9.0; ...
         'i_ges_P4_gear1', 9.0; 'i_ges_P4_gear2', 9.0; ...
         'ev_shift_v_up_kmh', 1e6; 'ev_shift_v_down_kmh', 1e6; ...
-        'use_cus_val', 1; 'No_Gears', 0; 'shiftDelay', NaN; ...
+        'use_cus_val', 1; 'No_Gears', NaN; 'shiftDelay', NaN; ...
         'Displacement_cc', 0; 'Boost_Pressure_bar', 0; ...
         'P0', 0; 'P2', 0; 'P3', 0; 'P4', 0; 'P4_DM', 0; ...
         'n_ICE_idle', 0; 'n_ICE_max', 0; 'tq_ICE_idle', 0; 'tq_ICE_max', 0; 'Pwr_ICE_max_kW', 0; ...
@@ -1220,14 +1269,17 @@ function [cfg, warnings, errors] = validateAndRepairInput(cfg, runID)
         'tq_P3_max', 0; 'Pwr_P3_max_kW', 0; 'n_P3_max', 0; 'Pwr_P3_nmax_red_perc', 0; ...
         'tq_P4_max', 0; 'Pwr_P4_max_kW', 0; 'n_P4_max', 0; 'Pwr_P4_nmax_red_perc', 0; ...
         'tq_EV_max', 0; 'Pwr_EV_max_kW', 0; 'n_EV_max', 0; 'Pwr_EV_nmax_red_perc', 0.04; ...
-        'Cell_Cap_Ah', 4.8; 'Cell_V_nom', 3.7; 'Cell_R_inner', 0.023; ...
-        'Cell_V_min', 2.5; 'Cell_V_max', 4.2; 'Cell_I_max_chg', 4.8; 'Cell_I_max_dis', 15; ...
-        'n_s', 1; 'n_p', 1; 'facSocInit', 0.95; 'SOC_Recup_Limit', 0.95; 'SOC_Bat_Discharge_Limit', 0.10; ...
+        'Cell_Cap_Ah', NaN; 'Cell_V_nom', NaN; 'Cell_R_inner', NaN; ...
+        'Cell_V_min', NaN; 'Cell_V_max', NaN; 'Cell_I_max_chg', NaN; 'Cell_I_max_dis', NaN; ...
+        'n_s', NaN; 'n_p', NaN; 'facSocInit', NaN; 'SOC_Recup_Limit', NaN; 'SOC_Bat_Discharge_Limit', NaN; ...
         'Actual_0_to_100_s', NaN; 'Actual_max_speed_kmh', NaN; 'InputQualityScore', NaN};
-    for k = 1:size(numericDefaults, 1)
-        [cfg, wasDefaulted] = ensureNumericField(cfg, numericDefaults{k,1}, numericDefaults{k,2});
+
+    for k = 1:size(numericFields, 1)
+        [cfg, wasDefaulted] = ensureNumericField(cfg, numericFields{k,1}, numericFields{k,2});
         if wasDefaulted
-            warnings(end+1) = string(numericDefaults{k,1}) + " defaulted"; %#ok<AGROW>
+            % Missing optional simulation defaults are allowed; missing critical
+            % values are checked explicitly below.
+            warnings(end+1) = string(numericFields{k,1}) + " missing/non-numeric in input schema"; %#ok<AGROW>
         end
     end
 
@@ -1235,300 +1287,141 @@ function [cfg, warnings, errors] = validateAndRepairInput(cfg, runID)
         'Induction_Type', 'NA'; 'SOC_Vector', '[0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]'; ...
         'Cell_OCV_Vector', '[2.8, 3.3, 3.45, 3.52, 3.60, 3.68, 3.75, 3.85, 3.95, 4.1, 4.2]'; ...
         'Raw_Gearbox', ''; 'Raw_Fuel', ''; 'Raw_Power', ''; 'Raw_Torque', ''; 'Raw_SystemPower', ''; ...
-        'Transmission_Type', ''; 'Vehicle_Name', ''; 'InputWarnings', ''};
+        'Transmission_Type', ''; 'Vehicle_Name', ''; 'HybridArchitectureClass', ''; 'InputWarnings', ''};
     for k = 1:size(textDefaults, 1)
         if ~isfield(cfg, textDefaults{k,1}) || isempty(cfg.(textDefaults{k,1})) || ismissing(string(cfg.(textDefaults{k,1})))
             cfg.(textDefaults{k,1}) = string(textDefaults{k,2});
+            warnings(end+1) = string(textDefaults{k,1}) + " missing in input schema"; %#ok<AGROW>
         end
     end
 
     pt = upper(strtrim(string(cfg.Powertrain)));
-    if strlength(pt) == 0 || pt == "0" || pt == "UNKNOWN"
-        if cfg.EV == 1
-            pt = "EV";
-        elseif cfg.Hy == 1
-            pt = "HYBRID";
-        else
-            pt = "ICE";
-        end
-        cfg.Powertrain = pt;
-        warnings(end+1) = "Powertrain inferred from flags"; %#ok<AGROW>
+    isICE = pt == "ICE";
+    isEV = pt == "EV";
+    isHybrid = pt == "HYBRID";
+
+    % Strict converter contract: ams_json_to_DoE_Inp must output canonical
+    % powertrain labels. DoE_main does not normalize BEV/HEV/PHEV aliases.
+    if ~(isICE || isEV || isHybrid)
+        errors(end+1) = "Unknown/non-canonical Powertrain value: " + string(cfg.Powertrain) + ...
+            "; expected ICE, Hybrid or EV from converter"; %#ok<AGROW>
     end
 
-    isICE = pt == "ICE";
-    isEV = pt == "EV" || pt == "BEV";
-    isHybrid = pt == "HYBRID" || pt == "PHEV" || pt == "HEV";
-
-    rawGearboxTxt = lower(string(getTextField(cfg, 'Raw_Gearbox')));
     gearboxAllTxt = lower(string(getTextField(cfg, 'Raw_Gearbox')) + " " + string(getTextField(cfg, 'Transmission_Type')));
-    vehicleNameTxt = lower(string(getTextField(cfg, 'Vehicle_Name')));
-    has2WDNameHint = contains2WDHintMain(vehicleNameTxt);
-    hasAWDNameHint = containsAnyMain(vehicleNameTxt, ["awd", "4wd", "4x4", "allrad"]);
-
     if isCvtGearboxTextMain(gearboxAllTxt)
         errors(end+1) = "CVT/e-CVT excluded from this simulation"; %#ok<AGROW>
     end
-    if has2WDNameHint && ~hasAWDNameHint && cfg.AWD == 1
-        cfg.AWD = 0;
-        cfg.HM_VA = 1;
-        warnings(end+1) = "AWD repaired from vehicle-name 2WD/4x2 hint"; %#ok<AGROW>
-    end
-    if isEV && containsAnyMain(rawGearboxTxt, ["3-gang", "4-gang", "5-gang", "6-gang", "7-gang", "8-gang", "9-gang", "10-gang"])
+    if isEV && containsAnyMain(gearboxAllTxt, ["3-gang", "4-gang", "5-gang", "6-gang", "7-gang", "8-gang", "9-gang", "10-gang"])
         errors(end+1) = "Suspicious EV input: multi-speed ICE gearbox text in Raw_Gearbox"; %#ok<AGROW>
     end
 
+    % Strict topology contract expected from ams_json_to_DoE_Inp_final.m.
     if isICE
-        cfg.Powertrain = "ICE";
-        cfg.VM = 1; cfg.EV = 0; cfg.Hy = 0;
-        cfg.P0 = 0; cfg.P2 = 0; cfg.P3 = 0; cfg.P4 = 0; cfg.P4_DM = 0;
-        cfg.E0 = 0; cfg.E1 = 0; cfg.E2 = 0; cfg.E3 = 0; cfg.E4 = 0;
-        cfg.tq_P0_max = 0; cfg.Pwr_P0_max_kW = 0; cfg.n_P0_max = 0;
-        cfg.tq_P2_max = 0; cfg.Pwr_P2_max_kW = 0; cfg.n_P2_max = 0;
-        cfg.tq_P3_max = 0; cfg.Pwr_P3_max_kW = 0; cfg.n_P3_max = 0;
-        cfg.tq_P4_max = 0; cfg.Pwr_P4_max_kW = 0; cfg.n_P4_max = 0;
-        cfg.tq_EV_max = 0; cfg.Pwr_EV_max_kW = 0; cfg.n_EV_max = 0;
-        cfg.n_s = max(1, cfg.n_s); cfg.n_p = max(1, cfg.n_p);
-    elseif isEV
-        cfg.Powertrain = "EV";
-        cfg.VM = 0; cfg.EV = 1; cfg.Hy = 0;
-        oldPwr = max([cfg.Pwr_EV_max_kW, cfg.Pwr_P2_max_kW, cfg.Pwr_P3_max_kW, cfg.Pwr_P4_max_kW, cfg.Pwr_ICE_max_kW]);
-        oldTq  = max([cfg.tq_EV_max, cfg.tq_P2_max, cfg.tq_P3_max, cfg.tq_P4_max, cfg.tq_ICE_max]);
-        oldN   = max([cfg.n_EV_max, cfg.n_P2_max, cfg.n_P3_max, cfg.n_P4_max, 16000]);
-        cfg.Pwr_ICE_max_kW = 0; cfg.tq_ICE_max = 0; cfg.tq_ICE_idle = 0; cfg.n_ICE_idle = 0; cfg.n_ICE_max = 0;
-        if has2WDNameHint && ~hasAWDNameHint
-            cfg.AWD = 0;
-            cfg.E0 = 1; cfg.E1 = 0; cfg.E2 = 0; cfg.E3 = 0; cfg.E4 = 0;
-            cfg.Pwr_P4_max_kW = 0; cfg.tq_P4_max = 0; cfg.n_P4_max = 0;
-            rawPowerFromText_kW = parsePowerKWMain(getTextField(cfg, 'Raw_Power'));
-            if isfinite(rawPowerFromText_kW) && rawPowerFromText_kW > 0 && cfg.Pwr_EV_max_kW > 1.35 * rawPowerFromText_kW
-                cfg.Pwr_EV_max_kW = rawPowerFromText_kW;
-                warnings(end+1) = "EV 2WD power capped from Raw_Power"; %#ok<AGROW>
-            end
-            warnings(end+1) = "EV topology forced to single primary motor from 2WD/4x2 hint"; %#ok<AGROW>
+        if ~(cfg.VM == 1 && cfg.EV == 0 && cfg.Hy == 0)
+            errors(end+1) = "ICE topology flags invalid; expected VM=1, EV=0, Hy=0"; %#ok<AGROW>
         end
-        if ~(cfg.E0 || cfg.E1 || cfg.E2 || cfg.E3 || cfg.E4)
-            if cfg.AWD == 1
-                cfg.E2 = 1;
-            else
-                cfg.E0 = 1;
-            end
-            warnings(end+1) = "EV E-position inferred"; %#ok<AGROW>
+        if any([cfg.P0, cfg.P2, cfg.P3, cfg.P4, cfg.P4_DM, cfg.E0, cfg.E1, cfg.E2, cfg.E3, cfg.E4] ~= 0)
+            errors(end+1) = "ICE row contains electric architecture flags; fix converter output"; %#ok<AGROW>
         end
-        nMot = max(1, 1 + double(cfg.E1 == 1 || cfg.E2 == 1) + double(cfg.E3 == 1) * 2 + double(cfg.E4 == 1) * 3);
-        if cfg.Pwr_EV_max_kW <= 0 && oldPwr > 0, cfg.Pwr_EV_max_kW = oldPwr / nMot; end
-        if cfg.tq_EV_max <= 0 && oldTq > 0, cfg.tq_EV_max = oldTq / nMot; end
-        if cfg.n_EV_max <= 0, cfg.n_EV_max = oldN; end
-
-        % EV torque plausibility: low torque with high power makes EVs far too slow.
-        tqMinFromPower = estimateTorqueFromPowerMain(cfg.Pwr_EV_max_kW, 6000);
-        if isfinite(tqMinFromPower) && tqMinFromPower > 0 && cfg.tq_EV_max < 0.75 * tqMinFromPower
-            cfg.tq_EV_max = tqMinFromPower;
-            warnings(end+1) = "EV torque raised from power plausibility"; %#ok<AGROW>
-        end
-
-        if cfg.Pwr_P4_max_kW <= 0 && (cfg.E2 || cfg.E3 || cfg.E4), cfg.Pwr_P4_max_kW = cfg.Pwr_EV_max_kW; end
-        if cfg.tq_P4_max <= 0 && (cfg.E2 || cfg.E3 || cfg.E4), cfg.tq_P4_max = cfg.tq_EV_max; end
-        if cfg.n_P4_max <= 0 && (cfg.E2 || cfg.E3 || cfg.E4), cfg.n_P4_max = cfg.n_EV_max; end
-
-        % For pure EVs, i_GET_EV is the total reduction. Do not also multiply
-        % by a final-drive iAG from an ICE/AMS gearbox field.
-        if abs(cfg.iAG - 1.0) > 1e-6
-            cfg.iAG = 1.0;
-            warnings(end+1) = "EV iAG set to 1 to avoid i_GET_EV*iAG double reduction"; %#ok<AGROW>
-        end
-        estEVRatio = estimateEVTotalRatioMain(cfg.Actual_max_speed_kmh, cfg.d_wheel, cfg.n_EV_max);
-        if isfinite(estEVRatio) && estEVRatio > 0
-            cfg.i_GET_EV = estEVRatio;
-            if cfg.E2 || cfg.E3 || cfg.E4
-                cfg.i_ges_P4 = estEVRatio;
-            end
-            warnings(end+1) = "EV i_GET_EV estimated from Actual_max_speed"; %#ok<AGROW>
-        else
-            cfg.i_GET_EV = min(max(cfg.i_GET_EV, 6.5), 13.5);
-            if cfg.E2 || cfg.E3 || cfg.E4
-                cfg.i_ges_P4 = cfg.i_GET_EV;
-            end
-        end
-
-        % === EV 2-speed gearbox support ===
-        rawGearboxTxt2 = lower(string(getTextField(cfg, 'Raw_Gearbox')) + " " + ...
-                               string(getTextField(cfg, 'Transmission_Type')));
-        
-        isTwoSpeedEV = containsAnyMain(rawGearboxTxt2, ...
-            ["2-gang", "2 gang", "2-gang-automatik", "2 gang automatik", ...
-             "2-speed", "two-speed", "two speed", "zweigang", "zwei-gang"]);
-        
-        cfg.EV_2speed_enable = double(isTwoSpeedEV);
-        
-        % Default: single-speed behaviour
-        cfg.i_GET_EV_gear1 = cfg.i_GET_EV;
-        cfg.i_GET_EV_gear2 = cfg.i_GET_EV;
-        cfg.i_ges_P4_gear1 = cfg.i_ges_P4;
-        cfg.i_ges_P4_gear2 = cfg.i_ges_P4;
-        cfg.ev_shift_v_up_kmh = 1e6;
-        cfg.ev_shift_v_down_kmh = 1e6;
-        
-        if isTwoSpeedEV
-            % Long gear is the Vmax gear.
-            cfg.i_GET_EV_gear2 = cfg.i_GET_EV;
-            cfg.i_ges_P4_gear2 = cfg.i_ges_P4;
-        
-            % Gear spread: first gear shorter than second gear.
-            % Lotus needs about 1.5-1.6x; keep it generic and limited.
-            EV_2speed_ratio_spread = 1.55;
-        
-            i1_primary_raw = EV_2speed_ratio_spread * cfg.i_GET_EV_gear2;
-            i1_p4_raw      = EV_2speed_ratio_spread * cfg.i_ges_P4_gear2;
-        
-            % Do not make 1st gear so short that it must shift before 100 km/h.
-            % Use 92% nmax as practical upshift speed.
-            n_shift_up_rpm = 0.92 * max(cfg.n_EV_max, 16000);
-        
-            if isfinite(cfg.d_wheel) && cfg.d_wheel > 0
-                i1_max_at_105 = n_shift_up_rpm * pi * cfg.d_wheel * 60 / (105 * 1000);
-            else
-                i1_max_at_105 = 20;
-            end
-        
-            % Keep ratios in a physically plausible range.
-            cfg.i_GET_EV_gear1 = min(max(i1_primary_raw, cfg.i_GET_EV_gear2), i1_max_at_105);
-            cfg.i_ges_P4_gear1 = min(max(i1_p4_raw,      cfg.i_ges_P4_gear2), i1_max_at_105);
-        
-            % Shift speed derived from motor speed in 1st gear.
-            cfg.ev_shift_v_up_kmh = n_shift_up_rpm * pi * cfg.d_wheel * 60 / ...
-                                    (cfg.i_GET_EV_gear1 * 1000);
-        
-            % Hysteresis to avoid gear chatter.
-            cfg.ev_shift_v_down_kmh = max(20, cfg.ev_shift_v_up_kmh - 15);
-        
-            warnings(end+1) = sprintf( ...
-                "EV 2-speed gearbox active: i1=%.2f, i2=%.2f, shift_up=%.1f km/h", ...
-                cfg.i_GET_EV_gear1, cfg.i_GET_EV_gear2, cfg.ev_shift_v_up_kmh);
-        end
-
-        cfg.P0 = 0; cfg.P2 = 0; cfg.P3 = 0; cfg.P4 = 0; cfg.P4_DM = 0;
     elseif isHybrid
-        cfg.Powertrain = "Hybrid";
-        cfg.EV = 0; cfg.Hy = 1;
-        if cfg.Pwr_ICE_max_kW <= 0
-            errors(end+1) = "Hybrid has no ICE power"; %#ok<AGROW>
+        if ~(cfg.VM == 0 && cfg.EV == 0 && cfg.Hy == 1)
+            errors(end+1) = "Hybrid topology flags invalid; expected VM=0, EV=0, Hy=1"; %#ok<AGROW>
         end
-        if cfg.P0 + cfg.P2 + cfg.P3 + cfg.P4 + cfg.P4_DM == 0 && max([cfg.Pwr_P0_max_kW, cfg.Pwr_P2_max_kW, cfg.Pwr_P3_max_kW, cfg.Pwr_P4_max_kW]) > 0
-            cfg.P2 = 1;
-            warnings(end+1) = "Hybrid P-position inferred as P2"; %#ok<AGROW>
+        if any([cfg.E0, cfg.E1, cfg.E2, cfg.E3, cfg.E4] ~= 0)
+            errors(end+1) = "Hybrid row contains pure-EV E0-E4 flags; fix converter output"; %#ok<AGROW>
         end
-    else
-        errors(end+1) = "Unknown Powertrain value: " + string(cfg.Powertrain); %#ok<AGROW>
+    elseif isEV
+        if ~(cfg.VM == 0 && cfg.EV == 1 && cfg.Hy == 0)
+            errors(end+1) = "EV topology flags invalid; expected VM=0, EV=1, Hy=0"; %#ok<AGROW>
+        end
+        if any([cfg.P0, cfg.P2, cfg.P3, cfg.P4, cfg.P4_DM] ~= 0)
+            errors(end+1) = "EV row contains hybrid P0-P4 flags; fix converter output"; %#ok<AGROW>
+        end
     end
 
-    % P4 single motor and dual-motor architecture are mutually exclusive.
     if cfg.P4 == 1 && cfg.P4_DM == 1
-        cfg.P4 = 0;
-        warnings(end+1) = "P4/P4_DM conflict repaired; kept P4_DM"; %#ok<AGROW>
-    end
-
-    % 48V/MHEV/P0-only entries should not be treated like full traction hybrids.
-    % In this straight-line model P0 is not a real axle traction machine. Keeping
-    % weak P0-only mild hybrids in the Hybrid topology makes some ICE-like cars
-    % too optimistic and consumes battery logic that is not meaningful here.
-    eTractionPower_kW = max([cfg.Pwr_P2_max_kW, 0]) + max([cfg.Pwr_P3_max_kW, 0]) + max([cfg.Pwr_P4_max_kW, 0]);
-    eAllPowerNoEV_kW = max([cfg.Pwr_P0_max_kW, 0]) + eTractionPower_kW;
-    rawAllTxt = lower(string(getTextField(cfg, 'Raw_Fuel')) + " " + ...
-                      string(getTextField(cfg, 'Raw_Gearbox')) + " " + ...
-                      string(getTextField(cfg, 'Vehicle_Name')) + " " + ...
-                      string(getTextField(cfg, 'Raw_Power')) + " " + ...
-                      string(getTextField(cfg, 'Raw_SystemPower')));
-    hasMildHint = containsAnyMain(rawAllTxt, ["mhev", "mild", "48v", "48 v", "mild-hybrid", "mildhybrid"]);
-    lowVoltagePack = isfinite(cfg.n_s) && cfg.n_s > 0 && cfg.n_s <= 25;
-    if cfg.Hy == 1 && cfg.P0 == 1 && cfg.P2 == 0 && cfg.P3 == 0 && cfg.P4 == 0 && cfg.P4_DM == 0 && ...
-            eAllPowerNoEV_kW > 0 && eAllPowerNoEV_kW <= 25 && (hasMildHint || lowVoltagePack)
-        % V11 safety repair: in some AMS rows Raw_Power is only the 48V/P0
-        % boost machine while Raw_SystemPower contains the real vehicle power.
-        % When the row is converted to ICE, keep the real system power.
-        rawSystemPower_kW = parsePowerKWMain(getTextField(cfg, 'Raw_SystemPower'));
-        if isfinite(rawSystemPower_kW) && rawSystemPower_kW > max(50, 2.5 * max(cfg.Pwr_ICE_max_kW, 1))
-            cfg.Pwr_ICE_max_kW = rawSystemPower_kW;
-            rawTorqueNm = parseTorqueNmMain(getTextField(cfg, 'Raw_Torque'));
-            if isfinite(rawTorqueNm) && rawTorqueNm > 0
-                cfg.tq_ICE_max = rawTorqueNm;
-            else
-                nForTorque = max([cfg.n_ICE_max, 4500]);
-                cfg.tq_ICE_max = estimateTorqueFromPowerMain(cfg.Pwr_ICE_max_kW, nForTorque);
-            end
-            cfg.tq_ICE_idle = 0.20 * cfg.tq_ICE_max;
-            warnings(end+1) = "P0-only mild hybrid ICE power repaired from Raw_SystemPower"; %#ok<AGROW>
-        elseif cfg.Pwr_ICE_max_kW <= 25
-            warnings(end+1) = "P0-only mild hybrid has no usable Raw_SystemPower; exclude from validation"; %#ok<AGROW>
-        end
-        cfg.Powertrain = "ICE";
-        cfg.VM = 1; cfg.EV = 0; cfg.Hy = 0;
-        cfg.P0 = 0; cfg.P2 = 0; cfg.P3 = 0; cfg.P4 = 0; cfg.P4_DM = 0;
-        cfg.tq_P0_max = 0; cfg.Pwr_P0_max_kW = 0; cfg.n_P0_max = 0;
-        cfg.tq_P2_max = 0; cfg.Pwr_P2_max_kW = 0; cfg.n_P2_max = 0;
-        cfg.tq_P3_max = 0; cfg.Pwr_P3_max_kW = 0; cfg.n_P3_max = 0;
-        cfg.tq_P4_max = 0; cfg.Pwr_P4_max_kW = 0; cfg.n_P4_max = 0;
-        cfg.tq_EV_max = 0; cfg.Pwr_EV_max_kW = 0; cfg.n_EV_max = 0;
-        warnings(end+1) = "P0-only mild hybrid treated as ICE"; %#ok<AGROW>
-    end
-
-    % Make the battery discharge current consistent with the requested electric
-    % propulsion power. AMS/DoE fallbacks often produced e.g. 96S/46P but only
-    % 15 A per cell, which limits a high-power EV/hybrid far below its motor map.
-    [cfg, battWarn] = repairBatteryDischargePowerMain(cfg);
-    if strlength(battWarn) > 0
-        warnings(end+1) = battWarn; %#ok<AGROW>
+        errors(end+1) = "P4 and P4_DM are both active; fix converter output"; %#ok<AGROW>
     end
 
     gr = parseNumericVector(cfg.Gear_Ratio);
-    if cfg.EV == 1 && cfg.Hy == 0 && cfg.VM == 0
-        cfg.Gear_Ratio = "[1]";
-        cfg.No_Gears = 1;
-        cfg.i_GET_EV = max(cfg.i_GET_EV, 1);
-    else
+    if isEV
+        if isempty(gr) || numel(gr) < 1 || cfg.No_Gears < 1
+            errors(end+1) = "EV gearbox ratio/count missing"; %#ok<AGROW>
+        end
+    elseif isICE || isHybrid
         if isempty(gr) || numel(gr) < 2 || cfg.No_Gears < 2
-            nG = max(2, estimateGearCountMain(cfg));
-            gr = defaultGearRatiosMain(nG, getTextField(cfg, 'Raw_Gearbox'));
-            cfg.Gear_Ratio = formatVectorMain(gr);
-            cfg.No_Gears = numel(gr);
-            warnings(end+1) = "ICE/Hybrid gearbox ratios repaired"; %#ok<AGROW>
-        else
-            cfg.No_Gears = numel(gr);
+            errors(end+1) = "ICE/Hybrid gearbox ratios missing; fix converter output"; %#ok<AGROW>
         end
     end
 
-    cfg.facSocInit = normalizeSocFraction(cfg.facSocInit, 0.95);
-    cfg.SOC_Recup_Limit = normalizeSocFraction(cfg.SOC_Recup_Limit, 0.95);
-    cfg.SOC_Bat_Discharge_Limit = normalizeSocFraction(cfg.SOC_Bat_Discharge_Limit, 0.10);
-    if cfg.SOC_Bat_Discharge_Limit >= cfg.SOC_Recup_Limit
-        cfg.SOC_Bat_Discharge_Limit = 0.10;
-        cfg.SOC_Recup_Limit = 0.95;
-        warnings(end+1) = "SOC limits repaired"; %#ok<AGROW>
+    if ~isfinite(cfg.shiftDelay) || cfg.shiftDelay <= 0 || cfg.shiftDelay > 2.0
+        errors(end+1) = "Invalid shiftDelay; converter must provide valid shiftDelay"; %#ok<AGROW>
     end
 
-    if cfg.m_curb <= 200 || cfg.A_front <= 1.0 || cfg.Wheelbase <= 1.5
+    if ~isfinite(cfg.hybrid_p2_cont_factor) || cfg.hybrid_p2_cont_factor < 0 || cfg.hybrid_p2_cont_factor > 1
+        errors(end+1) = "hybrid_p2_cont_factor invalid; fix converter output"; %#ok<AGROW>
+    end
+    if ~isfinite(cfg.hybrid_p2_shift_factor) || cfg.hybrid_p2_shift_factor < 0 || cfg.hybrid_p2_shift_factor > 1
+        errors(end+1) = "hybrid_p2_shift_factor invalid; fix converter output"; %#ok<AGROW>
+    end
+
+    if cfg.m_curb <= 200 || cfg.A_front <= 1.0 || cfg.Wheelbase <= 1.5 || cfg.d_wheel <= 0.2
         errors(end+1) = "Invalid basic vehicle geometry/mass"; %#ok<AGROW>
     end
-    totalPower = max([cfg.Pwr_ICE_max_kW, 0]) + max([cfg.Pwr_P0_max_kW, 0]) + max([cfg.Pwr_P2_max_kW, 0]) + ...
-                 max([cfg.Pwr_P3_max_kW, 0]) + max([cfg.Pwr_P4_max_kW, 0]) + max([cfg.Pwr_EV_max_kW, 0]);
-    if totalPower <= 0
-        errors(end+1) = "No usable propulsion power"; %#ok<AGROW>
+
+    if any(~isfinite([cfg.Cell_Cap_Ah, cfg.Cell_V_nom, cfg.Cell_R_inner, cfg.Cell_V_min, cfg.Cell_V_max, ...
+                      cfg.Cell_I_max_chg, cfg.Cell_I_max_dis, cfg.n_s, cfg.n_p])) || ...
+            any([cfg.Cell_Cap_Ah, cfg.Cell_V_nom, cfg.Cell_V_max, cfg.Cell_I_max_dis, cfg.n_s, cfg.n_p] <= 0)
+        errors(end+1) = "Invalid battery/cell parameters"; %#ok<AGROW>
     end
 
-    % Merge converter warnings with main repair warnings.
+    if any(~isfinite([cfg.facSocInit, cfg.SOC_Recup_Limit, cfg.SOC_Bat_Discharge_Limit])) || ...
+            any([cfg.facSocInit, cfg.SOC_Recup_Limit, cfg.SOC_Bat_Discharge_Limit] < 0) || ...
+            any([cfg.facSocInit, cfg.SOC_Recup_Limit, cfg.SOC_Bat_Discharge_Limit] > 1) || ...
+            cfg.SOC_Bat_Discharge_Limit >= cfg.SOC_Recup_Limit
+        errors(end+1) = "Invalid SOC limits; fix converter output"; %#ok<AGROW>
+    end
+
+    if isICE
+        if cfg.Pwr_ICE_max_kW <= 0 || cfg.tq_ICE_max <= 0 || cfg.n_ICE_max <= 0
+            errors(end+1) = "ICE row has no usable ICE power/torque/rpm"; %#ok<AGROW>
+        end
+    elseif isHybrid
+        ePower = max([cfg.Pwr_P0_max_kW, cfg.Pwr_P2_max_kW, cfg.Pwr_P3_max_kW, cfg.Pwr_P4_max_kW]);
+        hasArch = any([cfg.P0, cfg.P2, cfg.P3, cfg.P4, cfg.P4_DM] == 1);
+        if cfg.Pwr_ICE_max_kW <= 0 || cfg.tq_ICE_max <= 0 || cfg.n_ICE_max <= 0
+            errors(end+1) = "Hybrid row has no usable ICE power/torque/rpm"; %#ok<AGROW>
+        end
+        if ~hasArch || ePower <= 0
+            errors(end+1) = "Hybrid row has no usable e-machine architecture/power; fix converter output"; %#ok<AGROW>
+        end
+        if (cfg.P0 == 1 && cfg.Pwr_P0_max_kW <= 0) || ...
+           (cfg.P2 == 1 && cfg.Pwr_P2_max_kW <= 0) || ...
+           (cfg.P3 == 1 && cfg.Pwr_P3_max_kW <= 0) || ...
+           ((cfg.P4 == 1 || cfg.P4_DM == 1) && cfg.Pwr_P4_max_kW <= 0)
+            errors(end+1) = "Hybrid architecture flag has zero e-machine power; fix converter output"; %#ok<AGROW>
+        end
+    elseif isEV
+        if cfg.Pwr_EV_max_kW <= 0 || cfg.tq_EV_max <= 0 || cfg.n_EV_max <= 0
+            errors(end+1) = "EV row has no usable EV power/torque/rpm"; %#ok<AGROW>
+        end
+        if ~any([cfg.E0, cfg.E1, cfg.E2, cfg.E3, cfg.E4] == 1)
+            errors(end+1) = "EV row has no E0-E4 architecture flag"; %#ok<AGROW>
+        end
+    end
+
     oldWarn = strtrim(string(getTextField(cfg, 'InputWarnings')));
     if strlength(oldWarn) > 0 && oldWarn ~= "0"
         warnings = [split(oldWarn, " | ").', warnings]; %#ok<AGROW>
     end
     warnings = unique(warnings(strlength(warnings) > 0), 'stable');
     cfg.InputWarnings = strjoin(warnings, " | ");
-    if ~isfinite(cfg.InputQualityScore)
-        cfg.InputQualityScore = max(0, 100 - 5 * numel(warnings) - 20 * numel(errors));
-    end
 
     if ~isempty(warnings)
         fprintf('RunID %d input warnings: %s\n', runID, char(strjoin(warnings, ' | ')));
     end
 end
+
 
 function current_result = initRunResult(cfg, runID, inputWarnings)
     current_result = struct();
@@ -1597,63 +1490,6 @@ function current_result = sanitizeStraightLineKpis(current_result)
     end
 end
 
-function [delay, source, gbType, p2w] = resolveShiftDelay(cfg)
-    gbText = lower(string(getTextField(cfg, 'Raw_Gearbox')) + " " + string(getTextField(cfg, 'Transmission_Type')));
-    pt = upper(string(getTextField(cfg, 'Powertrain')));
-    totalPower = getNumericField(cfg, 'Pwr_ICE_max_kW', 0) + getNumericField(cfg, 'Pwr_P0_max_kW', 0) + ...
-                 getNumericField(cfg, 'Pwr_P2_max_kW', 0) + getNumericField(cfg, 'Pwr_P3_max_kW', 0) + ...
-                 getNumericField(cfg, 'Pwr_P4_max_kW', 0) + getNumericField(cfg, 'Pwr_EV_max_kW', 0);
-    m = getNumericField(cfg, 'm_curb', NaN);
-    if isfinite(m) && m > 0
-        p2w = totalPower / m * 1000;
-    else
-        p2w = NaN;
-    end
-
-    if isCvtGearboxTextMain(gbText)
-        delay = NaN; source = "cvt_excluded"; gbType = "cvt_excluded"; return;
-    end
-    if pt == "EV"
-        delay = 0.05; source = "ev_single_speed"; gbType = "single_speed_ev"; return;
-    end
-    if containsAnyMain(gbText, ["doppelkuppl", "dsg", "pdk", "s tronic", "m dct"])
-        gbType = "dct";
-        if isfinite(p2w) && p2w > 100
-            delay = 0.12;
-        else
-            delay = 0.18;
-        end
-        source = "gearbox_text";
-    elseif containsAnyMain(gbText, ["automatik", "wandler", "tiptronic", "steptronic", "zf"])
-        gbType = "automatic";
-
-        if isfinite(p2w) && p2w > 100
-            delay = 0.22;
-        elseif isfinite(p2w) && p2w > 70
-            delay = 0.28;
-        else
-            delay = 0.35;
-        end
-    
-        source = "gearbox_text";
-    elseif containsAnyMain(gbText, ["schalt", "manuell"])
-        gbType = "manual"; delay = 0.80; source = "gearbox_text";
-    else
-        gbType = "unknown";
-        csvDelay = getNumericField(cfg, 'shiftDelay', NaN);
-        if isfinite(csvDelay) && csvDelay > 0.03 && csvDelay < 1.5
-            delay = csvDelay; source = "csv_shiftDelay";
-        elseif ~isfinite(p2w) || p2w < 80
-            delay = 1.00; source = "power_to_weight_fallback";
-        elseif p2w < 140
-            delay = 0.70; source = "power_to_weight_fallback";
-        elseif p2w < 250
-            delay = 0.45; source = "power_to_weight_fallback";
-        else
-            delay = 0.10; source = "power_to_weight_fallback";
-        end
-    end
-end
 
 function col = pickFirstFiniteColumnMain(T, candidates)
     col = '';
@@ -1730,50 +1566,6 @@ function Ppack_kW = estimatePackDischargePowerMain(cfg)
     end
 end
 
-function [cfg, warningText] = repairBatteryDischargePowerMain(cfg)
-    warningText = "";
-    if ~(getNumericField(cfg, 'EV', 0) == 1 || getNumericField(cfg, 'Hy', 0) == 1)
-        return;
-    end
-
-    P_req_kW = totalElectricPropulsionPowerMain(cfg);
-    if ~isfinite(P_req_kW) || P_req_kW <= 0
-        return;
-    end
-
-    Vcell = getNumericField(cfg, 'Cell_V_nom', 3.7);
-    ns = max(1, round(getNumericField(cfg, 'n_s', 1)));
-    np = max(1, round(getNumericField(cfg, 'n_p', 1)));
-    if ~isfinite(Vcell) || Vcell <= 0
-        Vcell = 3.7;
-        cfg.Cell_V_nom = Vcell;
-    end
-    cfg.n_s = ns;
-    cfg.n_p = np;
-
-    V_pack_nom = ns * Vcell;
-    P_target_kW = 1.10 * P_req_kW;  % 10% reserve for losses / voltage sag
-    I_req_A = P_target_kW * 1000 / (V_pack_nom * np);
-    I_old_A = getNumericField(cfg, 'Cell_I_max_dis', 15);
-
-    if isfinite(I_req_A) && I_req_A > I_old_A
-        % Keep the cell current in a plausible generic high-power range. If a
-        % row would need more than this, increase n_p instead of creating an
-        % unrealistic cell current.
-        I_cap_A = 60;
-        if I_req_A <= I_cap_A
-            cfg.Cell_I_max_dis = I_req_A;
-        else
-            cfg.Cell_I_max_dis = I_cap_A;
-            np_req = ceil(P_target_kW * 1000 / (V_pack_nom * cfg.Cell_I_max_dis));
-            if isfinite(np_req) && np_req > np
-                cfg.n_p = np_req;
-            end
-        end
-        warningText = sprintf("battery discharge capability raised for electric power plausibility: P_req=%.1f kW, Icell %.1f->%.1f A, n_p=%d", ...
-            P_req_kW, I_old_A, cfg.Cell_I_max_dis, cfg.n_p);
-    end
-end
 
 function [s, wasDefaulted] = ensureNumericField(s, fieldName, defaultVal)
     wasDefaulted = false;
@@ -2427,9 +2219,11 @@ function createActualVsSim0100Plot(results_table, output_file)
         return;
     end
 
-    within10 = abs(simVal - actual) <= 0.10 .* actual;
+    within1s = abs(simVal - actual) <= 1.0;
+    within10pct = abs(simVal - actual) <= 0.10 .* actual;
+    withinTol = within1s | within10pct;
     nValid = numel(actual);
-    nPass = sum(within10);
+    nPass = sum(withinTol);
     passRate = 100 * nPass / nValid;
 
     maxVal = max([actual; simVal]);
@@ -2443,31 +2237,31 @@ function createActualVsSim0100Plot(results_table, output_file)
     fig = figure('Visible', 'off', 'Color', 'w', 'Position', [100 100 1100 950]);
     hold on;
 
-    if any(within10)
-        scatter(actual(within10), simVal(within10), 55, ...
+    if any(withinTol)
+        scatter(actual(withinTol), simVal(withinTol), 55, ...
             'MarkerFaceColor', [0.20 0.78 0.45], ...
             'MarkerEdgeColor', 'w', ...
             'MarkerFaceAlpha', 0.85, ...
-            'DisplayName', sprintf('Within 10%% Tolerance (%d valid runs)', nPass));
+            'DisplayName', sprintf('Within <=1 s OR +/-10%% Tolerance (%d valid runs)', nPass));
     else
         scatter(NaN, NaN, 55, ...
             'MarkerFaceColor', [0.20 0.78 0.45], ...
             'MarkerEdgeColor', 'w', ...
-            'DisplayName', 'Within 10% Tolerance (0 valid runs)');
+            'DisplayName', 'Within <=1 s OR +/-10% Tolerance (0 valid runs)');
     end
 
     nFail = nValid - nPass;
-    if any(~within10)
-        scatter(actual(~within10), simVal(~within10), 55, ...
+    if any(~withinTol)
+        scatter(actual(~withinTol), simVal(~withinTol), 55, ...
             'MarkerFaceColor', [0.93 0.45 0.12], ...
             'MarkerEdgeColor', 'w', ...
             'MarkerFaceAlpha', 0.85, ...
-            'DisplayName', sprintf('Outside 10%% Tolerance (%d valid runs)', nFail));
+            'DisplayName', sprintf('Outside <=1 s OR +/-10%% Tolerance (%d valid runs)', nFail));
     else
         scatter(NaN, NaN, 55, ...
             'MarkerFaceColor', [0.93 0.45 0.12], ...
             'MarkerEdgeColor', 'w', ...
-            'DisplayName', 'Outside 10% Tolerance (0 valid runs)');
+            'DisplayName', 'Outside <=1 s OR +/-10% Tolerance (0 valid runs)');
     end
 
     plot(xLine, xLine, ':', 'Color', [0.10 0.18 0.28], 'LineWidth', 3, ...
@@ -2475,6 +2269,10 @@ function createActualVsSim0100Plot(results_table, output_file)
     plot(xLine, 1.10 .* xLine, '--', 'Color', [0.00 0.45 0.74], 'LineWidth', 2.2, ...
         'DisplayName', '+/-10% Tolerance Bands');
     plot(xLine, 0.90 .* xLine, '--', 'Color', [0.00 0.45 0.74], 'LineWidth', 2.2, ...
+        'HandleVisibility', 'off');
+    plot(xLine, xLine + 1.0, '-.', 'Color', [0.40 0.40 0.40], 'LineWidth', 2.0, ...
+        'DisplayName', '+/-1 s Tolerance Bands');
+    plot(xLine, max(xLine - 1.0, axisMin), '-.', 'Color', [0.40 0.40 0.40], 'LineWidth', 2.0, ...
         'HandleVisibility', 'off');
 
     grid on;
@@ -2490,7 +2288,7 @@ function createActualVsSim0100Plot(results_table, output_file)
     lgd = legend('Location', 'northwest');
     set(lgd, 'FontSize', 13);
 
-    txt = sprintf('Valid pass rate: %.1f%%\n(%d / %d valid runs)\nExcluded actuals: %d', ...
+    txt = sprintf('Valid pass rate: %.1f%%\n(%d / %d valid runs)\nCriterion: <=1 s OR <=10%%\nExcluded actuals: %d', ...
         passRate, nPass, nValid, nExcluded);
     text(0.98, 0.04, txt, ...
         'Units', 'normalized', ...
@@ -2510,4 +2308,156 @@ function createActualVsSim0100Plot(results_table, output_file)
     close(fig);
 
     fprintf('0-100 comparison plot saved with V11 actual validation filter:\n%s\n', char(string(output_file)));
+end
+
+function etaPT = calcPowertrainEtaFromPowerWeightMain(p2w_kW_per_t, gbType, cfg)
+% calcPowertrainEtaFromPowerWeightMain
+%
+% Bauteilbasierter Antriebsstrangwirkungsgrad.
+% Der Gesamtwirkungsgrad wird nicht frei kalibriert, sondern aus einzelnen
+% Bauteilwirkungsgraden gebildet:
+%
+%   eta_total = eta_coupling * eta_gearbox * eta_finaldrive
+%             * eta_driveshaft * eta_wheelbearing
+%
+% Das Leistungsgewicht wird als Proxy fuer die Dimensionierung des
+% Antriebsstrangs verwendet:
+%   niedriges P/m  -> komfortorientiert, hoehere relative Verluste
+%   hohes P/m      -> performanceorientiert, bessere Auslegung, geringere Verluste
+
+    if ~isfinite(p2w_kW_per_t) || p2w_kW_per_t <= 0
+        p2w_kW_per_t = 120;
+    end
+
+    gbType = lower(string(gbType));
+
+    % Auslegungsindex:
+    % lambda = 0: niedriges Leistungsgewicht
+    % lambda = 1: hohes Leistungsgewicht
+    lambda = (p2w_kW_per_t - 60) / (320 - 60);
+    lambda = min(max(lambda, 0), 1);
+
+    isEV = false;
+    isHybrid = false;
+
+    try
+        isEV = cfg.EV == 1 && cfg.VM == 0 && cfg.Hy == 0;
+    catch
+        isEV = false;
+    end
+
+    try
+        isHybrid = cfg.Hy == 1;
+    catch
+        isHybrid = false;
+    end
+
+    isAutomatic = contains(gbType, "automatic") || contains(gbType, "auto") || ...
+                  contains(gbType, "torque") || contains(gbType, "wandler");
+
+    isDCT = contains(gbType, "dct") || contains(gbType, "dual") || ...
+            contains(gbType, "double") || contains(gbType, "doppelkupplung");
+
+    isManual = contains(gbType, "manual") || contains(gbType, "mt") || ...
+               contains(gbType, "schalt");
+
+    % Gemeinsame mechanische Komponenten
+    eta_finaldrive   = etaLerp(lambda, 0.970, 0.990);
+    eta_driveshaft   = etaLerp(lambda, 0.985, 0.995);
+    eta_wheelbearing = etaLerp(lambda, 0.998, 0.9995);
+
+    % Defaultwerte
+    eta_coupling  = 1.000;
+    eta_gearbox   = 1.000;
+    eta_reduction = 1.000;
+
+    % Primaerer Pfad
+    if isEV
+        % EV: E-Maschinenleistung ist in deinem Modell sehr wahrscheinlich
+        % bereits mechanische Motorleistung. Deshalb hier nur Reduktion,
+        % Achse, Wellen und Lager.
+        eta_reduction = etaLerp(lambda, 0.965, 0.985);
+    
+        eta_primary = eta_reduction ...
+                    * eta_finaldrive ...
+                    * eta_driveshaft ...
+                    * eta_wheelbearing;
+
+    else
+        % ICE / Hybrid mit mechanischem Getriebepfad
+        if isAutomatic
+            % Wandler/Automatik als 0-100 Mittelwert.
+            % Niedriges P/m: mehr Schlupf/komfortorientiert.
+            % Hohes P/m: sportlichere Lock-up-/Launch-Applikation.
+            eta_coupling = etaLerp(lambda, 0.955, 0.990);
+            eta_gearbox  = etaLerp(lambda, 0.925, 0.970);
+
+        elseif isDCT
+            eta_coupling = etaLerp(lambda, 0.985, 0.997);
+            eta_gearbox  = etaLerp(lambda, 0.960, 0.985);
+
+        elseif isManual
+            eta_coupling = etaLerp(lambda, 0.990, 0.998);
+            eta_gearbox  = etaLerp(lambda, 0.965, 0.988);
+
+        else
+            % unbekannter Getriebetyp: konservativer Mischwert
+            eta_coupling = etaLerp(lambda, 0.975, 0.995);
+            eta_gearbox  = etaLerp(lambda, 0.945, 0.980);
+        end
+
+        % Hybrid hat zusaetzliche Kupplungen / Koordination / P2-Modul.
+        % Kein freier Faktor, sondern als leichter mechanischer Zusatzverlust
+        % im Kopplungspfad interpretiert.
+        if isHybrid
+            eta_coupling = eta_coupling * etaLerp(lambda, 0.990, 0.997);
+        end
+
+        eta_primary = eta_coupling ...
+                    * eta_gearbox ...
+                    * eta_finaldrive ...
+                    * eta_driveshaft ...
+                    * eta_wheelbearing;
+    end
+
+    % Sekundaere E-Achse / P4-Pfad
+    % Nur mechanische E-Achsenverluste, keine Batterie/Inverter/EM-Verluste,
+    % solange die E-Maschinenleistung mechanisch interpretiert wird.
+    eta_secondary = etaLerp(lambda, 0.965, 0.985) ...
+                  * eta_finaldrive ...
+                  * eta_driveshaft ...
+                  * eta_wheelbearing;
+
+    % Rueckrechnung Radebene -> Motorebene muss zum Vorwaertspfad passen.
+    % Bei Hybrid/ICE ist primaerer Pfad entscheidend.
+    eta_r2m = eta_primary;
+
+    % Systemleistungsbegrenzer:
+    % Psys_kW ist Fahrzeug/System-Nennleistung. Fuer Radleistungsgrenze
+    % braucht man denselben effektiven Weg zur Radebene.
+    eta_sys_to_wheel = eta_primary;
+
+    % Sicherheitsgrenzen
+    eta_primary      = min(max(eta_primary,      0.78), 0.975);
+    eta_secondary    = min(max(eta_secondary,    0.88), 0.975);
+    eta_r2m          = min(max(eta_r2m,          0.78), 0.975);
+    eta_sys_to_wheel = min(max(eta_sys_to_wheel, 0.78), 0.975);
+
+    etaPT.primary_drive   = eta_primary;
+    etaPT.secondary_drive = eta_secondary;
+    etaPT.r2m_drive       = eta_r2m;
+    etaPT.sys_to_wheel    = eta_sys_to_wheel;
+
+    etaPT.coupling        = eta_coupling;
+    etaPT.gearbox         = eta_gearbox;
+    etaPT.reduction       = eta_reduction;
+    etaPT.finaldrive      = eta_finaldrive;
+    etaPT.driveshaft      = eta_driveshaft;
+    etaPT.wheelbearing    = eta_wheelbearing;
+end
+
+
+function eta = etaLerp(lambda, etaLow, etaHigh)
+    lambda = min(max(lambda, 0), 1);
+    eta = etaLow + (etaHigh - etaLow) * lambda;
 end

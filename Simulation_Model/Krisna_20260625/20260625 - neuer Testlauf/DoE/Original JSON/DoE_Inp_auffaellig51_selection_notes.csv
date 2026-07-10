@@ -1,0 +1,52 @@
+RUN_ID,Vehicle_Name,Powertrain,Actual_0_to_100_s,SelectionScore,SelectionReason,HybridArchitectureClass,Pwr_ICE_max_kW,Pwr_P2_max_kW,Pwr_P4_max_kW,Pwr_EV_max_kW
+1492,Ferrari F80,Hybrid,2.2,525,named diagnostic case | hybrid baseline | P4/e-axle hybrid | PHEV keyword | performance hybrid high system power | hypercar/performance PHEV | strong P4 e-axle | very fast actual 0-100,p4_hybrid_eaxle,662,0,221,0
+1496,Ferrari Sf90 Stradale,Hybrid,2.3,525,named diagnostic case | hybrid baseline | P4/e-axle hybrid | PHEV keyword | performance hybrid high system power | hypercar/performance PHEV | strong P4 e-axle | very fast actual 0-100,p4_hybrid_eaxle,586,0,171,0
+4550,Porsche 918 Spyder (ab 2014),Hybrid,2.6,525,named diagnostic case | hybrid baseline | P4/e-axle hybrid | PHEV keyword | performance hybrid high system power | hypercar/performance PHEV | strong P4 e-axle | very fast actual 0-100,p4_hybrid_eaxle,447,0,210,0
+4603,Renault Captur E-Tech Plug-in Hybrid (ab 2020),Hybrid,10.6,355,named diagnostic case | hybrid baseline | P2 hybrid | PHEV keyword | series-like/complex hybrid | small P2 HEV | slow/mid acceleration check,series_like_or_complex,69,36,0,0
+3655,Nissan X-Trail 1.5 VC-T e-Power (ab 2022),Hybrid,7,350,named diagnostic case | hybrid baseline | P4/e-axle hybrid | PHEV keyword | series-like/complex hybrid | strong P4 e-axle,series_like_or_complex,116,0,141,0
+4604,Renault Captur E-Tech Plug-in Hybrid (ab 2020),Hybrid,8.9,335,named diagnostic case | hybrid baseline | P2 hybrid | PHEV keyword | series-like/complex hybrid | small P2 HEV,series_like_or_complex,80,36,0,0
+1490,Ferrari 849 Testarossa,Hybrid,2.3,315,hybrid baseline | P2 hybrid | performance hybrid high system power | hypercar/performance PHEV | very fast actual 0-100,p2_hev,611,161,0,0
+2891,Mclaren P1,Hybrid,2.8,315,hybrid baseline | P2 hybrid | performance hybrid high system power | hypercar/performance PHEV | very fast actual 0-100,p2_hev,542,132,0,0
+4766,Renault Symbioz E-Tech 145 (ab 2024),Hybrid,10.6,310,named diagnostic case | hybrid baseline | P2 hybrid | series-like/complex hybrid | small P2 HEV | slow/mid acceleration check,series_like_or_complex,69,36,0,0
+4767,Renault Symbioz E-Tech 145 (ab 2024),Hybrid,9.1,310,named diagnostic case | hybrid baseline | P2 hybrid | series-like/complex hybrid | small P2 HEV | slow/mid acceleration check,series_like_or_complex,80,36,0,0
+4768,Renault Symbioz E-Tech 145 (ab 2024),Hybrid,11,310,named diagnostic case | hybrid baseline | P2 hybrid | series-like/complex hybrid | small P2 HEV | slow/mid acceleration check,series_like_or_complex,103,12,0,0
+3909,Opel Grandland X 1.6 DI Turbo (ab 2019),Hybrid,6.1,295,named diagnostic case | hybrid baseline | P4/e-axle hybrid | PHEV keyword | strong P4 e-axle,p4_hybrid_eaxle,147,0,160,0
+3654,Nissan X-Trail 1.5 VC-T e-Power (ab 2022),Hybrid,8,290,named diagnostic case | hybrid baseline | P2 hybrid | series-like/complex hybrid | small P2 HEV,series_like_or_complex,116,34,0,0
+4638,Renault E-Tech 160 (ab 2025),Hybrid,8.3,290,named diagnostic case | hybrid baseline | P2 hybrid | series-like/complex hybrid | small P2 HEV,series_like_or_complex,80,36,0,0
+3458,Mitsubishi Outlander 2.0 2WD (ab 2018),Hybrid,10.5,280,named diagnostic case | hybrid baseline | P4/e-axle hybrid | PHEV keyword | slow/mid acceleration check,p4_hybrid_eaxle,99,0,66,0
+4634,Renault Clio E-Tech 140 (ab 2020),Hybrid,9.9,280,named diagnostic case | hybrid baseline | P2 hybrid | series-like/complex hybrid | slow/mid acceleration check,series_like_or_complex,67,53,0,0
+4635,Renault Clio E-Tech 145 (ab 2022),Hybrid,9.3,280,named diagnostic case | hybrid baseline | P2 hybrid | series-like/complex hybrid | slow/mid acceleration check,series_like_or_complex,69,51,0,0
+4636,Renault Clio E-Tech 145 (ab 2022),Hybrid,9.3,280,named diagnostic case | hybrid baseline | P2 hybrid | series-like/complex hybrid | slow/mid acceleration check,series_like_or_complex,69,51,0,0
+11,Alfa Romeo Tonale,Hybrid,6.6,260,named diagnostic case | hybrid baseline | P4/e-axle hybrid | PHEV keyword,p4_phev_eaxle,110,0,67.5,0
+12,Alfa Romeo Tonale,Hybrid,6.6,260,named diagnostic case | hybrid baseline | P4/e-axle hybrid | PHEV keyword,p4_phev_eaxle,110,0,67.5,0
+13,Alfa Romeo Tonale,Hybrid,6.6,260,named diagnostic case | hybrid baseline | P4/e-axle hybrid | PHEV keyword,p4_phev_eaxle,118,0,67.5,0
+3459,Mitsubishi Outlander Plug-in-Hybrid (ab 2024),Hybrid,7.9,260,named diagnostic case | hybrid baseline | P4/e-axle hybrid | PHEV keyword,p4_phev_eaxle,100,0,93.75,0
+4149,Peugeot 3008 Hybrid4 (ab 2012),Hybrid,8.5,260,named diagnostic case | hybrid baseline | P4/e-axle hybrid | PHEV keyword,p4_phev_eaxle,147,0,20,0
+4150,Peugeot 3008 Hybrid4 (ab 2012),Hybrid,8.5,260,named diagnostic case | hybrid baseline | P4/e-axle hybrid | PHEV keyword,p4_phev_eaxle,147,0,20,0
+4151,Peugeot 3008 Hybrid4 (ab 2012),Hybrid,8.5,260,named diagnostic case | hybrid baseline | P4/e-axle hybrid | PHEV keyword,p4_phev_eaxle,147,0,20,0
+547,Audi RS e-tron GT performance,EV,2.9,355,named diagnostic case | EV baseline | EV 2-speed gearbox | AWD/multi-motor EV | high-performance EV | very fast actual 0-100,none,0,0,315,315
+548,Audi RS e-tron GT,EV,2.5,355,named diagnostic case | EV baseline | EV 2-speed gearbox | AWD/multi-motor EV | high-performance EV | very fast actual 0-100,none,0,0,340,340
+2558,Lotus Eletre (ab 2022),EV,2.9,355,named diagnostic case | EV baseline | EV 2-speed gearbox | AWD/multi-motor EV | high-performance EV | very fast actual 0-100,none,0,0,337.5,337.5
+2561,Lotus Emeya (ab 2024),EV,2.8,355,named diagnostic case | EV baseline | EV 2-speed gearbox | AWD/multi-motor EV | high-performance EV | very fast actual 0-100,none,0,0,337.5,337.5
+471,Audi e-tron GT quattro (ab 2025),EV,4,250,named diagnostic case | EV baseline | EV 2-speed gearbox | AWD/multi-motor EV,none,0,0,215,215
+472,Audi e-tron GT quattro (ab 2025),EV,3.4,250,named diagnostic case | EV baseline | EV 2-speed gearbox | AWD/multi-motor EV,none,0,0,250,250
+497,Audi e-tron GT quattro (ab 2025),EV,3.4,250,named diagnostic case | EV baseline | EV 2-speed gearbox | AWD/multi-motor EV,none,0,0,250,250
+4539,Porsche Taycan 4 Black Edition (ab 2025),EV,4.6,250,named diagnostic case | EV baseline | EV 2-speed gearbox | AWD/multi-motor EV,none,0,0,160,160
+4540,Porsche Taycan 4 Black Edition (ab 2025),EV,3.7,250,named diagnostic case | EV baseline | EV 2-speed gearbox | AWD/multi-motor EV,none,0,0,220,220
+4543,Porsche Taycan (ab 2024),EV,4.6,250,named diagnostic case | EV baseline | EV 2-speed gearbox | AWD/multi-motor EV,none,0,0,150,150
+4544,Porsche Taycan (ab 2021),EV,3.7,250,named diagnostic case | EV baseline | EV 2-speed gearbox | AWD/multi-motor EV,none,0,0,200,200
+4545,Porsche Taycan 4S (ab 2020),EV,3.7,250,named diagnostic case | EV baseline | EV 2-speed gearbox | AWD/multi-motor EV,none,0,0,220,220
+4546,Porsche Taycan Sport Turismo 4S Black Edition (ab 2025),EV,4.7,250,named diagnostic case | EV baseline | EV 2-speed gearbox | AWD/multi-motor EV,none,0,0,160,160
+4547,Porsche Taycan Cross Turismo 4 (ab 2024),EV,3.8,250,named diagnostic case | EV baseline | EV 2-speed gearbox | AWD/multi-motor EV,none,0,0,220,220
+4541,Porsche Taycan 4 Black Edition (ab 2025),EV,4.8,215,named diagnostic case | EV baseline | EV 2-speed gearbox,none,0,0,0,320
+4595,Renault 5 E-Tech 120 (ab 2024),EV,9,180,named diagnostic case | EV baseline | low-power EV acceleration check | slow/mid acceleration check,none,0,0,0,90
+1826,Hyundai Santa Fe 2.4 (ab 2000),ICE,11.7,165,named diagnostic case | low-power ICE control | slow/mid acceleration check,none,107,0,0,0
+1828,Hyundai Santa Fe 2.4 2WD (ab 2001),ICE,11.6,165,named diagnostic case | low-power ICE control | slow/mid acceleration check,none,127,0,0,0
+1829,Hyundai Santa Fe 2.4 2WD (ab 2009),ICE,10.7,165,named diagnostic case | low-power ICE control | slow/mid acceleration check,none,129,0,0,0
+1830,Hyundai Santa Fe 2.4 2WD (ab 2009),ICE,11.2,165,named diagnostic case | low-power ICE control | slow/mid acceleration check,none,129,0,0,0
+1831,Hyundai Santa Fe 2.4 2WD (ab 2009),ICE,10,165,named diagnostic case | low-power ICE control | slow/mid acceleration check,none,139,0,0,0
+1832,Hyundai Santa Fe 2.4 4WD (ab 2009),ICE,10,165,named diagnostic case | low-power ICE control | slow/mid acceleration check,none,139,0,0,0
+1833,Hyundai Santa Fe 2.4 2WD (ab 2009),ICE,11.7,165,named diagnostic case | low-power ICE control | slow/mid acceleration check,none,139,0,0,0
+1834,Hyundai Santa Fe 2.4 GDI 2WD (ab 2016),ICE,9.9,165,named diagnostic case | low-power ICE control | slow/mid acceleration check,none,138,0,0,0
+3445,Mitsubishi Outlander 2.0 2WD (ab 2005),ICE,10.7,165,named diagnostic case | low-power ICE control | slow/mid acceleration check,none,100,0,0,0
+3446,Mitsubishi Outlander 2.0 2WD (ab 2005),ICE,11.4,165,named diagnostic case | low-power ICE control | slow/mid acceleration check,none,100,0,0,0
